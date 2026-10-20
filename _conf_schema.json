@@ -1,0 +1,18 @@
+{
+  "ffmpeg_path": {"type": "string", "description": "FFmpeg 可执行文件路径", "hint": "留空从 PATH 查找；容器部署时填写容器内路径。", "default": ""},
+  "ffprobe_path": {"type": "string", "description": "ffprobe 可执行文件路径", "hint": "留空从 PATH 查找。", "default": ""},
+  "allowed_video_roots": {"type": "list", "description": "额外允许读取的视频目录", "hint": "AstrBot data 和 temp 目录默认允许。仅填写已存在的绝对目录；普通用户仍只能访问自己在当前会话提供的视频，管理员可读取允许目录内的文件。", "default": [], "items": {"type": "string"}},
+  "overview_provider_id": {"type": "string", "description": "概览看图模型（可选）", "hint": "从 AstrBot 已配置的模型中选择，所选模型必须支持图片。留空时直接把概览图片交给主模型；选择后由该模型生成带时间戳的描述，主模型只接收文字。仅影响 video_overview，video_inspect 仍返回原图。调用失败会报错，不自动改为主模型看图。", "default": "", "_special": "select_provider"},
+  "overview_interval": {"type": "float", "description": "概览默认采样间隔（秒）", "default": 4.0},
+  "overview_max_frames": {"type": "int", "description": "概览总帧数上限", "hint": "包含固定、边界和变化帧。超预算增大间隔，不截掉后半段。注意模型自身的图片数量和上下文限制。", "default": 200},
+  "overview_max_edge": {"type": "int", "description": "概览图片长边上限（像素）", "default": 640},
+  "scene_threshold": {"type": "float", "description": "场景变化阈值", "hint": "0～1，越低越敏感。变化候选不等于语义重要帧。", "default": 0.3},
+  "inspect_max_frames": {"type": "int", "description": "单次回看帧数上限", "default": 8},
+  "inspect_max_edge": {"type": "int", "description": "回看默认图片长边（像素）", "default": 768},
+  "max_edge_limit": {"type": "int", "description": "模型请求图片长边的硬上限（像素）", "default": 1280},
+  "inspect_max_calls": {"type": "int", "description": "单个问题的回看次数上限", "hint": "同一问题中所有视频共享次数，执行失败也计入；新消息重新计数。", "default": 3},
+  "tool_timeout": {"type": "float", "description": "单次工具调用总超时（秒）", "default": 300.0},
+  "max_concurrency": {"type": "int", "description": "并发处理与子进程数量上限", "default": 2},
+  "cache_ttl": {"type": "float", "description": "抽帧缓存与会话授权有效期（秒）", "default": 3600.0},
+  "cache_max_mb": {"type": "int", "description": "抽帧缓存容量上限（MB）", "hint": "启动及工具空闲时清理过期缓存，超容量时从最旧缓存开始清理；不会删除源视频。", "default": 512}
+}
