@@ -265,6 +265,35 @@ async def test_native_routes_auth_upload_and_cleanup(sessions, sample_video):
         )
         assert response.status_code == 200
         session = response.json()["data"]
+        assert (await client.get("/debug/state", headers=headers())).json()["data"][
+            "active_session_id"
+        ] == session["id"]
+        page_body = {
+            "id": session["id"],
+            "csrf": state["csrf"],
+            "revision": 0,
+            "writer": "a" * 32,
+            "sequence": 1,
+            "state": {"view": -1, "parameters": {"overview_interval": "1.5"}},
+        }
+        assert (
+            await client.post(
+                "/debug/page-state",
+                json={**page_body, "csrf": "wrong"},
+                headers=headers(),
+            )
+        ).status_code == 403
+        response = await client.post(
+            "/debug/page-state", json=page_body, headers=headers()
+        )
+        assert response.status_code == 200
+        restored = (
+            await client.get(
+                "/debug/session", params={"id": session["id"]}, headers=headers()
+            )
+        ).json()["data"]
+        assert restored["page_state"] == page_body["state"]
+        assert restored["completed"] == 0
         body = {
             "id": session["id"],
             "csrf": state["csrf"],
@@ -284,6 +313,67 @@ async def test_native_routes_auth_upload_and_cleanup(sessions, sample_video):
     await web.close()
     assert len(context.registered_web_apis) == 1
     assert not sessions.sessions
+
+
+async def test_page_state_restores_selection_and_rejects_stale_writes(sessions):
+    first = await sessions.upload("admin", Upload(b"first", "first.mp4"))
+    second = await sessions.upload("admin", Upload(b"second", "second.mp4"))
+    other = await sessions.upload("other", Upload(b"other", "other.mp4"))
+    assert sessions.active_session("admin") == second.id
+    assert sessions.active_session("other") == other.id
+    writer = "a" * 32
+    state = {
+        "view": 7,
+        "parameters": {"overview_interval": "", "scene_threshold": "0.1"},
+        "model_draft": {
+            "provider_id": "vision",
+            "mode": "grid",
+            "question": "未提交的问题",
+        },
+        "pair_index": 4,
+        "selected_runs": ["saved-run"],
+        "pages": [[first.id + "/0/gallery/最终保留帧", 2]],
+        "video_time": 12.5,
+    }
+    sessions.save_page_state(first, 0, writer, 2, state)
+    # 较早的请求即使晚到，也不能覆盖最后一次编辑。
+    sessions.save_page_state(first, 0, writer, 1, {"view": 0})
+    assert sessions.snapshot(first)["page_state"] == state
+    assert sessions.active_session("admin") == first.id
+    assert sessions.active_session("other") == other.id
+    assert not second.page_state and not other.page_state
+    state["model_draft"]["question"] = "外部修改"
+    assert first.page_state["model_draft"]["question"] == "未提交的问题"
+    await sessions.reset(first, {})
+    assert not first.page_state and not first.page_writers
+    with pytest.raises(ValueError, match="版本"):
+        sessions.save_page_state(first, 0, writer, 3, {"view": 7})
+    sessions.save_page_state(first, 1, writer, 4, {"view": -1})
+    await sessions.delete(first)
+    assert sessions.active_session("admin") == second.id
+    second.touched -= sessions.ttl + 1
+    await sessions.prune()
+    assert sessions.active_session("admin") is None
+    assert sessions.active_session("other") == other.id
+
+
+@pytest.mark.parametrize(
+    ("writer", "sequence", "state"),
+    [
+        ("invalid", 1, {}),
+        ("a" * 32, True, {}),
+        ("a" * 32, 0, {}),
+        ("a" * 32, 1, []),
+        ("a" * 32, 1, {"unexpected": "value"}),
+        ("a" * 32, 1, {"view": float("nan")}),
+        ("a" * 32, 1, {"model_draft": {"question": "中" * 9000}}),
+    ],
+)
+async def test_invalid_page_state_is_not_saved(sessions, writer, sequence, state):
+    session = await sessions.upload("admin", Upload(b"video"))
+    with pytest.raises(ValueError, match="页面状态"):
+        sessions.save_page_state(session, 0, writer, sequence, state)
+    assert not session.page_state and not session.page_writers
 
 
 async def test_native_page_discovery_and_assets(tmp_path, monkeypatch):

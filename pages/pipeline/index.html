@@ -22,6 +22,7 @@
           <label id="drop-zone" class="upload" for="video-file"><span class="upload-icon" aria-hidden="true">↑</span><strong>选择或拖入视频</strong><span>MP4 / MKV / MOV / WebM 等<br>最大 256 MiB</span><input id="video-file" type="file" accept="video/*,.mkv,.ts,.flv,.avi,.wmv,.ogv"></label>
           <p id="file-name" class="filename">还没有上传视频</p>
           <video id="source-video" controls preload="metadata" hidden></video>
+          <div id="restore-video" hidden><label class="button full" for="source-file">选择原视频继续播放<input id="source-file" type="file" accept="video/*,.mkv,.ts,.flv,.avi,.wmv,.ogv" hidden></label><p class="small muted">测试进度已恢复。关联原视频仅用于本地播放，无需再次上传或处理。</p></div>
           <label class="field session-field" for="sessions">已有测试<select id="sessions"><option value="">选择测试会话</option></select></label>
           <button id="delete" class="button subtle full" disabled>删除本次测试</button>
         </section>

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import shutil
 import time
 import uuid
@@ -62,6 +63,8 @@ class DebugSession:
     task: asyncio.Task | None = None
     operation: str | None = None
     model: ModelState = field(default_factory=ModelState)
+    page_state: dict = field(default_factory=dict)
+    page_writers: dict[str, int] = field(default_factory=dict)
     assets: set[asyncio.Task] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -73,6 +76,7 @@ class DebugSessions:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.slots = slots
         self.sessions: dict[str, DebugSession] = {}
+        self.active_sessions: dict[str, str] = {}
         self.ttl = min(media.settings.cache_ttl, 3600)
         self.closed = False
         self.janitor: asyncio.Task | None = None
@@ -162,7 +166,61 @@ class DebugSessions:
             self.sessions.pop(identifier, None)
             self._remove(directory)
             raise
+        self.active_sessions[owner] = identifier
         return session
+
+    def active_session(self, owner: str) -> str | None:
+        identifier = self.active_sessions.get(owner)
+        session = self.sessions.get(identifier)
+        if session is not None and session.owner == owner:
+            return identifier
+        return next(
+            (
+                item.id
+                for item in reversed(list(self.sessions.values()))
+                if item.owner == owner
+            ),
+            None,
+        )
+
+    def save_page_state(
+        self, session: DebugSession, revision, writer, sequence, state
+    ) -> None:
+        self._active(session)
+        if type(revision) is not int or revision != session.revision:
+            raise ValueError("测试版本已变化，请重新读取状态")
+        if (
+            not isinstance(writer, str)
+            or len(writer) != 32
+            or any(c not in "0123456789abcdef" for c in writer)
+            or type(sequence) is not int
+            or not 0 < sequence < 2**53
+            or not isinstance(state, dict)
+            or set(state)
+            - {
+                "view",
+                "parameters",
+                "model_draft",
+                "pair_index",
+                "pages",
+                "selected_runs",
+                "video_time",
+            }
+        ):
+            raise ValueError("无效的页面状态")
+        try:
+            encoded = json.dumps(state, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("无效的页面状态") from exc
+        if len(encoded.encode("utf-8")) > 24 * 1024:
+            raise ValueError("页面状态过大")
+        if sequence <= session.page_writers.get(writer, 0):
+            return
+        if writer not in session.page_writers and len(session.page_writers) >= 16:
+            del session.page_writers[next(iter(session.page_writers))]
+        session.page_writers[writer] = sequence
+        session.page_state = json.loads(encoded)
+        self.active_sessions[session.owner] = session.id
 
     def get(self, owner: str, identifier: str) -> DebugSession:
         if self.closed:
@@ -268,11 +326,15 @@ class DebugSessions:
             session.elapsed = session.preview_elapsed = 0
             session.error = None
             session.model = ModelState()
+            session.page_state.clear()
+            session.page_writers.clear()
 
     async def delete(self, session: DebugSession) -> None:
         async with session.lock:
             await self._stop(session)
             self.sessions.pop(session.id, None)
+            if self.active_sessions.get(session.owner) == session.id:
+                self.active_sessions.pop(session.owner, None)
             self._remove(session.directory)
 
     @staticmethod
@@ -304,6 +366,7 @@ class DebugSessions:
             "filename": session.filename,
             "size": session.size,
             "revision": session.revision,
+            "page_state": session.page_state,
             "completed": pipeline.completed,
             "running": session.task is not None,
             "operation": session.operation,

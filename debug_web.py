@@ -32,6 +32,7 @@ class DebugWeb:
             "model-records": "GET",
             "model-prepare": "POST",
             "model-run": "POST",
+            "page-state": "POST",
             "upload/<csrf_token>": "POST",
             "next": "POST",
             "reset": "POST",
@@ -113,6 +114,7 @@ class DebugWeb:
                     "ttl_seconds": self.sessions.ttl,
                     "providers": self.sessions.models.providers(self.context),
                     "default_provider_id": self.sessions.media.settings.overview_provider_id,
+                    "active_session_id": self.sessions.active_session(owner),
                     "sessions": [
                         {"id": session.id, "filename": session.filename}
                         for session in self.sessions.sessions.values()
@@ -161,7 +163,19 @@ class DebugWeb:
                     raise ValueError("请求必须是 JSON 对象")
                 self._check_nonce(owner, body.get("csrf"))
                 session = self.sessions.get(owner, body.get("id"))
-                if action == "next":
+                if action == "page-state":
+                    self.sessions.save_page_state(
+                        session,
+                        body.get("revision"),
+                        body.get("writer"),
+                        body.get("sequence"),
+                        body.get("state"),
+                    )
+                    return json_response(
+                        {"status": "ok", "data": {"saved": True}},
+                        headers={"Cache-Control": "no-store"},
+                    )
+                elif action == "next":
                     await self.sessions.next(
                         session, body.get("completed"), body.get("revision")
                     )

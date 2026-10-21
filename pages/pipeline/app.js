@@ -11,6 +11,8 @@ const imageCache = new Map(), imageQueue = [], pages = new Map();
 const modelDetails = new Map();
 let modelDraft = {provider_id: "", question: "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: "frames"};
 let modelPreview = null, selectedRuns = [], pendingModelRun = null;
+const pageWriter = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
+let pageSequence = 0, restoringPage = true, pageSaveScheduled = false, lastPageState = "", videoPosition = 0;
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -32,8 +34,59 @@ function message(text, error = false) {
   $("message").textContent = text;
   $("message").className = error ? "error" : "";
 }
-function remember(id) { try { if (id) localStorage.setItem("vision-debug-session", id); else localStorage.removeItem("vision-debug-session"); } catch {} }
-function remembered() { try { return localStorage.getItem("vision-debug-session"); } catch { return null; } }
+function savePageState() {
+  if (restoringPage || !session || !config) return;
+  const state = {
+    view, parameters: Object.fromEntries(parameterNames.map(key => [key, $(key).value])),
+    model_draft: {...modelDraft}, pair_index: pairIndex, pages: [...pages].slice(-64),
+    selected_runs: selectedRuns.slice(-2), video_time: videoPosition,
+  };
+  const key = JSON.stringify([session.id, session.revision, state]);
+  if (lastPageState === key) return;
+  lastPageState = key;
+  const capture = {id: session.id, revision: session.revision};
+  // 沙箱页面没有 localStorage；变化时立即通过桥接保存，避免离开页面时来不及提交。
+  bridge.apiPost("debug/page-state", {csrf: config.csrf, ...capture, writer: pageWriter, sequence: ++pageSequence, state}).catch(error => {
+    if (lastPageState !== key || session?.id !== capture.id || session?.revision !== capture.revision) return;
+    lastPageState = "";
+    message(error.message || "页面状态保存失败，返回后可能无法恢复刚才的操作。", true);
+  });
+}
+function schedulePageSave() {
+  if (pageSaveScheduled) return;
+  pageSaveScheduled = true;
+  queueMicrotask(() => {pageSaveScheduled = false; savePageState();});
+}
+function restorePageState(state) {
+  if (!state || typeof state !== "object") return;
+  if (Number.isInteger(state.view) && ((state.view >= 0 && state.view < session.completed) || (state.view === 7 && session.done))) view = state.view;
+  if (state.parameters && typeof state.parameters === "object") for (const key of parameterNames) {
+    const value = state.parameters[key];
+    if ((typeof value === "string" || typeof value === "number") && String(value).length <= 64) $(key).value = value;
+  }
+  const draft = state.model_draft;
+  if (draft && typeof draft.provider_id === "string" && typeof draft.question === "string" && ["frames", "grid"].includes(draft.mode)) modelDraft = {provider_id: draft.provider_id.slice(0, 1024), question: draft.question.slice(0, 4000), mode: draft.mode};
+  if (Number.isInteger(state.pair_index)) pairIndex = Math.max(0, Math.min(state.pair_index, session.dedup_trace.length - 1));
+  if (Array.isArray(state.pages)) for (const entry of state.pages.slice(-64)) {
+    if (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].length <= 256 && Number.isInteger(entry[1]) && entry[1] >= 0) pages.set(entry[0], entry[1]);
+  }
+  if (Array.isArray(state.selected_runs)) selectedRuns = state.selected_runs.filter(id => session.model.runs.some(run => run.id === id)).slice(-2);
+  if (Number.isFinite(state.video_time) && state.video_time >= 0) videoPosition = state.video_time;
+}
+async function openSession(id) {
+  restoringPage = true;
+  try {
+    const data = await bridge.apiGet("debug/session", {id});
+    accept(data, false, true);
+    const prepared = data.model.prepared;
+    if (prepared && prepared.provider.id === modelDraft.provider_id && prepared.question === modelDraft.question && prepared.mode === modelDraft.mode) {
+      try {
+        const detail = await bridge.apiGet("debug/model-record", {id, record: prepared.id});
+        if (session?.id === id && session.revision === data.revision) {modelPreview = detail.input; renderKey = ""; render();}
+      } catch (error) {message(error.message || "输入预览恢复失败，可重新加载预览。", true);}
+    }
+  } finally {restoringPage = false; schedulePageSave();}
+}
 function params() {
   return Object.fromEntries(parameterNames.map(key => [key, key === "overview_output_mode" ? $(key).value : Number($(key).value)]));
 }
@@ -60,12 +113,11 @@ async function action(work) {
   catch (error) { message(error.message || "操作失败，请重试", true); }
   finally { busy = false; updateControls(); }
 }
-function accept(data, selectLatest = false) {
+function accept(data, selectLatest = false, restoreView = false) {
   if (session?.id === data.id && (data.revision < session.revision || (data.revision === session.revision && data.completed < session.completed))) return;
   const changed = !session || session.id !== data.id || session.revision !== data.revision;
   const advanced = session && data.completed > session.completed;
   session = data;
-  remember(data.id);
   if (changed) {
     modelDetails.clear(); modelPreview = null; selectedRuns = []; pendingModelRun = null;
     const previous = data.model.prepared || data.model.runs.at(-1)?.input;
@@ -75,9 +127,11 @@ function accept(data, selectLatest = false) {
     imageQueue.splice(0).forEach(job => job.reject(new Error("测试已切换")));
     setParams(data.parameters);
     pairIndex = 0;
+    videoPosition = 0;
     closeDialog();
   }
   if (changed || selectLatest || advanced) view = data.completed - 1;
+  if (restoreView) restorePageState(data.page_state);
   render();
   schedulePoll();
 }
@@ -122,9 +176,11 @@ function updateControls() {
   if ($("model-call")) $("model-call").disabled = busy || running || session?.model.preparing || !previewMatches();
 }
 function render() {
+  schedulePageSave();
   updateControls();
   $("file-name").textContent = session ? session.filename + " · " + bytes(session.size) : "还没有上传视频";
   $("source-video").hidden = !videoURL || selectedVideoSession !== session?.id;
+  $("restore-video").hidden = !session || (videoURL && selectedVideoSession === session.id);
   if (session) $("sessions").value = session.id;
   $("stages").replaceChildren();
   stageTitles.forEach((title, index) => {
@@ -250,7 +306,7 @@ function renderDedup(parent) {
   slider.type = "range"; slider.min = 0; slider.max = session.dedup_trace.length - 1; slider.value = Math.min(pairIndex, Number(slider.max));
   slider.setAttribute("aria-label", "选择去重比较步骤");
   const body = node("div");
-  const draw = () => { pairIndex = Number(slider.value); label.textContent = (pairIndex + 1) + " / " + session.dedup_trace.length; drawPair(body, session.dedup_trace[pairIndex]); };
+  const draw = () => { pairIndex = Number(slider.value); label.textContent = (pairIndex + 1) + " / " + session.dedup_trace.length; drawPair(body, session.dedup_trace[pairIndex]); schedulePageSave(); };
   slider.addEventListener("input", draw);
   controls.append(button("←", () => {slider.value = Math.max(0, Number(slider.value) - 1); draw();}), slider, label, button("→", () => {slider.value = Math.min(Number(slider.max), Number(slider.value) + 1); draw();}));
   parent.append(controls, body); draw();
@@ -305,7 +361,7 @@ function renderModel(parent) {
   provider.value = modelDraft.provider_id; providerField.append(provider);
   const modeField = node("label", "field", "本次图片模式"), mode = node("select"); mode.id = "model-mode"; mode.append(new Option("独立帧", "frames"), new Option("九宫格", "grid")); mode.value = modelDraft.mode; modeField.append(mode); row.append(providerField, modeField);
   const questionField = node("label", "field", "测试问题"), question = node("textarea"); question.id = "model-question"; question.rows = 4; question.maxLength = 4000; question.required = true; question.value = modelDraft.question; questionField.append(question);
-  const onChange = () => {modelDraft = {provider_id: provider.value, mode: mode.value, question: question.value}; updateControls();};
+  const onChange = () => {modelDraft = {provider_id: provider.value, mode: mode.value, question: question.value}; updateControls(); savePageState();};
   provider.addEventListener("change", onChange); mode.addEventListener("change", onChange); question.addEventListener("input", onChange);
   const controls = node("div", "inline-actions"), preview = node("button", "button", "预览模型输入"); preview.type = "submit";
   const call = button("调用模型", () => action(startModel), "button primary"); call.id = "model-call";
@@ -384,7 +440,7 @@ function table(parent, title, headers, rows) {
     section.replaceChildren();
     const page = Math.min(pages.get(key) || 0, Math.max(0, Math.ceil(rows.length / 40) - 1));
     const header = node("div", "gallery-header"); header.append(node("h3", "", title));
-    header.append(pager(page, rows.length, 40, delta => {pages.set(key, page + delta); draw();})); section.append(header);
+    header.append(pager(page, rows.length, 40, delta => {pages.set(key, page + delta); draw(); savePageState();})); section.append(header);
     if (!rows.length) { section.append(node("p", "muted small", "没有需要记录的候选。")); return; }
     const wrapper = node("div", "table-scroll"), table = node("table", "data-table"), head = node("thead"), headRow = node("tr");
     headers.forEach(value => headRow.append(node("th", "", value))); head.append(headRow); table.append(head);
@@ -406,7 +462,7 @@ function gallery(parent, title, items, kind, variant = "thumb", size = 24) {
     section.querySelectorAll(".frame-image").forEach(item => observer.unobserve(item));
     section.replaceChildren();
     const page = Math.min(pages.get(key) || 0, Math.max(0, Math.ceil(items.length / size) - 1));
-    const header = node("div", "gallery-header"); header.append(node("h3", "", title), pager(page, items.length, size, delta => {pages.set(key, page + delta); draw();})); section.append(header);
+    const header = node("div", "gallery-header"); header.append(node("h3", "", title), pager(page, items.length, size, delta => {pages.set(key, page + delta); draw(); savePageState();})); section.append(header);
     if (!items.length) {section.append(node("p", "muted small", "此路没有候选帧。")); return;}
     const strip = node("div", "filmstrip");
     items.slice(page * size, (page + 1) * size).forEach((item, offset) => strip.append(frameCard(item, kind, item.assetIndex ?? page * size + offset, variant)));
@@ -546,31 +602,48 @@ async function upload(file) {
     if (file.size > config.max_upload_bytes) throw new Error("视频不能超过 256 MiB");
     message("正在上传视频…");
     const data = await bridge.upload("debug/upload/" + encodeURIComponent(config.csrf), file);
-    if (videoURL) URL.revokeObjectURL(videoURL);
-    videoURL = URL.createObjectURL(file); selectedVideoSession = data.id;
-    $("source-video").src = videoURL;
-    accept(data, true); await loadSessions(); message("");
+    accept(data, true); attachVideo(file); await loadSessions(); message("");
   });
   $("video-file").value = "";
+}
+function attachVideo(file) {
+  if (videoURL) URL.revokeObjectURL(videoURL);
+  videoURL = URL.createObjectURL(file); selectedVideoSession = session.id;
+  const video = $("source-video"), position = videoPosition;
+  video.addEventListener("loadedmetadata", () => {if (selectedVideoSession === session?.id) video.currentTime = position;}, {once: true});
+  video.src = videoURL;
+  render();
 }
 function bindEvents() {
   $("video-file").addEventListener("change", event => upload(event.target.files[0]));
   $("drop-zone").addEventListener("dragover", event => {event.preventDefault(); $("drop-zone").classList.add("dragging");});
   $("drop-zone").addEventListener("dragleave", () => $("drop-zone").classList.remove("dragging"));
   $("drop-zone").addEventListener("drop", event => {event.preventDefault(); $("drop-zone").classList.remove("dragging"); upload(event.dataTransfer.files[0]);});
+  $("source-file").addEventListener("change", event => {
+    const file = event.target.files[0]; event.target.value = "";
+    if (!file || !session) return;
+    if (file.size !== session.size || file.name.slice(0, 160) !== session.filename) {message("请选择本次测试原来上传的视频文件。", true); return;}
+    message(""); attachVideo(file);
+  });
+  const rememberVideoTime = () => {if (selectedVideoSession === session?.id) {videoPosition = $("source-video").currentTime; savePageState();}};
+  $("source-video").addEventListener("seeked", rememberVideoTime);
+  $("source-video").addEventListener("pause", rememberVideoTime);
+  $("source-video").addEventListener("timeupdate", () => {if (Math.floor($("source-video").currentTime / 5) !== Math.floor(videoPosition / 5)) rememberVideoTime();});
+  $("parameters").addEventListener("input", savePageState);
+  $("parameters").addEventListener("change", savePageState);
   $("next").addEventListener("click", () => {if (session?.done) {view = 7; render(); return;} action(async () => {accept(await post("next", {completed: session.completed, revision: session.revision}));});});
   $("cancel").addEventListener("click", () => action(async () => accept(await post("cancel"))));
   $("parameters").addEventListener("submit", event => {event.preventDefault(); if (!$("parameters").reportValidity()) return; action(async () => {accept(await post("reset", {parameters: params()}), true); message("已应用本次参数。点击执行视频探测开始重跑。");});});
   $("delete").addEventListener("click", () => action(async () => {
-    await post("delete"); session = null; view = -1; clearTimeout(pollTimer); remember(null); imageCache.clear(); closeDialog();
+    await post("delete"); session = null; view = -1; clearTimeout(pollTimer); lastPageState = ""; imageCache.clear(); closeDialog();
     if (videoURL) URL.revokeObjectURL(videoURL); videoURL = null; $("source-video").removeAttribute("src");
     $("content").replaceChildren(node("p", "muted", "测试文件与图片已删除，可上传新视频。"));
     await loadSessions(); render();
   }));
-  $("sessions").addEventListener("change", event => {if (event.target.value) action(async () => accept(await bridge.apiGet("debug/session", {id: event.target.value}), true));});
+  $("sessions").addEventListener("change", event => {if (event.target.value) action(() => openSession(event.target.value));});
   $("close-dialog").addEventListener("click", closeDialog);
   $("image-dialog").addEventListener("cancel", () => {dialogVersion++;});
-  window.addEventListener("pagehide", () => {clearTimeout(pollTimer); clearTimeout(previewTimer); if (videoURL) URL.revokeObjectURL(videoURL); observer.disconnect();});
+  window.addEventListener("pagehide", () => {savePageState(); clearTimeout(pollTimer); clearTimeout(previewTimer); if (videoURL) URL.revokeObjectURL(videoURL); observer.disconnect();});
 }
 async function initialize() {
   try {
@@ -579,9 +652,9 @@ async function initialize() {
     await bridge.ready();
     bridge.onContext(context => {document.documentElement.dataset.theme = context.isDark ? "dark" : "light";});
     await loadSessions(); setParams(config.defaults); bindEvents();
-    const previous = remembered();
-    if (previous && config.sessions.some(item => item.id === previous)) accept(await bridge.apiGet("debug/session", {id: previous}), true);
-    else render();
+    const previous = config.active_session_id;
+    if (previous && config.sessions.some(item => item.id === previous)) await openSession(previous);
+    else {restoringPage = false; render();}
   } catch (error) {message(error.message || "调试台初始化失败", true); updateControls();}
 }
 initialize();
