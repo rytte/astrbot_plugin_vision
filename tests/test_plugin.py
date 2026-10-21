@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from astrbot.api import AstrBotConfig
 from astrbot.api.message_components import Reply, Video
+from astrbot.api.star import Context
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.message import ImageURLPart, Message
 from astrbot.core.agent.run_context import ContextWrapper
@@ -18,8 +19,13 @@ from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.star.register.star_handler import llm_tools
+from astrbot.core.star.star import StarMetadata
+from astrbot.core.star.star_manager import PluginManager
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.main import VisionPlugin
+from astrbot_plugin_vision.media import VideoError
+from astrbot_plugin_vision.tools import VideoInspectTool
+from jsonschema import ValidationError, validate
 
 
 class Event:
@@ -65,7 +71,11 @@ def plugin(tmp_path, monkeypatch):
         "astrbot_plugin_vision.main.StarTools.get_data_dir",
         lambda name: tmp_path / "plugin",
     )
-    return VisionPlugin(SimpleNamespace(llm_generate=AsyncMock()), {})
+    context = SimpleNamespace(
+        llm_generate=AsyncMock(), provider_manager=SimpleNamespace(llm_tools=llm_tools)
+    )
+    context.add_llm_tools = lambda *tools: Context.add_llm_tools(context, *tools)
+    return VisionPlugin(context, {})
 
 
 @pytest.fixture
@@ -101,14 +111,122 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert schema["overview_provider_id"]["default"] == ""
 
 
-def test_registered_tools_have_provider_compatible_schema():
+def test_registered_tools_have_provider_compatible_schema(plugin):
     overview = llm_tools.get_func("video_overview")
     inspect = llm_tools.get_func("video_inspect")
+    assert isinstance(inspect, VideoInspectTool)
+    assert inspect.handler is None
     assert overview.parameters["properties"]["video_path"]["type"] == "string"
-    assert inspect.parameters["properties"]["timestamps_sec"]["items"] == {
-        "type": "number"
+    properties = inspect.parameters["properties"]
+    assert set(properties) == {
+        "video_path",
+        "mode",
+        "times_sec",
+        "max_frames",
+        "max_edge",
     }
-    assert set(inspect.parameters) == {"type", "properties"}
+    assert properties["mode"]["enum"] == ["range", "timestamps"]
+    assert properties["times_sec"]["items"]["type"] == "number"
+    assert properties["max_frames"]["type"] == ["integer", "null"]
+    assert properties["max_edge"]["type"] == ["integer", "null"]
+    assert set(inspect.parameters["required"]) == set(properties)
+    assert inspect.parameters["additionalProperties"] is False
+    assert (
+        ToolSet([inspect]).openai_schema()[0]["function"]["parameters"]
+        == inspect.parameters
+    )
+    for mode, times in (("range", [0, 11.5]), ("timestamps", [1, 5, 9, 10.5, 11.5])):
+        validate(
+            {
+                "video_path": "video.mp4",
+                "mode": mode,
+                "times_sec": times,
+                "max_frames": None,
+                "max_edge": None,
+            },
+            inspect.parameters,
+        )
+
+
+def test_inspect_tool_belongs_to_plugin_for_loading_and_unloading(plugin, monkeypatch):
+    module = "data.plugins.astrbot_plugin_vision"
+    monkeypatch.setattr(VideoInspectTool, "__module__", f"{module}.tools")
+    metadata = StarMetadata(module_path=f"{module}.main", star_cls=plugin)
+    monkeypatch.setattr("astrbot.core.star.context.star_registry", [metadata])
+    tool = VideoInspectTool(plugin)
+    plugin.context.add_llm_tools(tool)
+    assert tool.handler_module_path == metadata.module_path
+    assert PluginManager._is_plugin_llm_tool(tool, metadata.module_path)
+    assert tool.handler is None
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"start_sec": 0, "end_sec": 0, "timestamps_sec": [1, 5, 9, 10.5, 11.5]},
+        {"start_sec": 0, "end_sec": 11.5, "timestamps_sec": []},
+        {"start_sec": 0, "end_sec": 11.5, "timestamps_sec": [1, 5, 9, 10.5, 11.5]},
+        {"mode": "range", "times_sec": []},
+        {"mode": "auto", "times_sec": [0]},
+        {"mode": "timestamps", "times_sec": [0], "start_sec": 0},
+    ],
+)
+def test_schema_rejects_logged_mixed_arguments_and_unknown_fields(plugin, arguments):
+    with pytest.raises(ValidationError):
+        validate(
+            {
+                "video_path": "video.mp4",
+                "max_frames": None,
+                "max_edge": None,
+                **arguments,
+            },
+            llm_tools.get_func("video_inspect").parameters,
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"mode": "range"},
+        {"mode": "range", "times_sec": []},
+        {"mode": "auto", "times_sec": [0]},
+        {"mode": "timestamps", "times_sec": [0], "max_frames": 0},
+        {"mode": "timestamps", "times_sec": [0], "unexpected": True},
+        {"start_sec": 0, "end_sec": 0, "timestamps_sec": [1, 5, 9, 10.5, 11.5]},
+        {"start_sec": 0, "end_sec": 11.5, "timestamps_sec": []},
+        {"start_sec": 0, "end_sec": 11.5, "timestamps_sec": [1, 5, 9, 10.5, 11.5]},
+    ],
+)
+async def test_native_executor_rejects_invalid_arguments_before_processing(
+    plugin, arguments
+):
+    event = Event(admin=True)
+    plugin.service.inspect = AsyncMock()
+    tool = llm_tools.get_func("video_inspect")
+    tool_arguments = {
+        "video_path": "video.mp4",
+        "max_frames": None,
+        "max_edge": None,
+        **arguments,
+    }
+    results = [
+        result
+        async for result in FunctionToolExecutor.execute(
+            tool,
+            ContextWrapper(context=SimpleNamespace(event=event)),
+            **tool_arguments,
+        )
+    ]
+    assert len(results) == 1
+    result = results[0]
+    assert result.isError
+    assert data(result)["error"]["code"] == "INVALID_ARGUMENT"
+    assert data(result)["error"]["examples"]
+    assert data(result)["remaining_inspect_calls"] == 3
+    assert plugin._state(event)["inspect_calls"] == 0
+    plugin.service.inspect.assert_not_awaited()
+    assert not image_parts(event)
 
 
 async def test_agent_context_is_bound_per_event_and_released(plugin):
@@ -133,7 +251,9 @@ async def test_missing_agent_context_fails_before_extracting_frames(
 ):
     plugin.service.overview = AsyncMock()
     plugin.service.inspect = AsyncMock()
-    arguments = {"timestamps_sec": [0]} if tool_name == "video_inspect" else {}
+    arguments = (
+        {"mode": "timestamps", "times_sec": [0]} if tool_name == "video_inspect" else {}
+    )
     event = Event(admin=True, agent=False)
     result = await getattr(plugin, tool_name)(event, str(sample_video), **arguments)
     assert result.isError
@@ -145,33 +265,52 @@ async def test_missing_agent_context_fails_before_extracting_frames(
     assert not plugin._state(event)["overviews"]
 
 
-@pytest.mark.parametrize("tool_name", ["video_overview", "video_inspect"])
+@pytest.mark.parametrize(
+    "tool_name,mode,invalid_first",
+    [
+        ("video_overview", None, False),
+        ("video_inspect", "range", False),
+        ("video_inspect", "timestamps", False),
+        ("video_inspect", "timestamps", True),
+    ],
+)
 async def test_real_agent_loop_receives_images_without_generic_send_prompt(
-    plugin, sample_video, tool_name
+    plugin, sample_video, tool_name, mode, invalid_first
 ):
     event = Event(admin=True, agent=False)
     arguments = {"video_path": str(sample_video)}
     if tool_name == "video_inspect":
-        arguments["timestamps_sec"] = [0, 1]
-    tool = FunctionTool(
-        name=tool_name,
-        description="查看视频帧",
-        parameters=llm_tools.get_func(tool_name).parameters,
-        handler=getattr(plugin, tool_name),
-    )
+        arguments.update(mode=mode, times_sec=[0, 1], max_frames=None, max_edge=None)
+    tool = llm_tools.get_func(tool_name)
+    if tool_name == "video_overview":
+        tool = FunctionTool(
+            name=tool_name,
+            description=tool.description,
+            parameters=tool.parameters,
+            handler=plugin.video_overview,
+        )
+    responses = [
+        LLMResponse(
+            role="assistant",
+            tools_call_name=[tool_name],
+            tools_call_args=[arguments],
+            tools_call_ids=["call_video"],
+        ),
+        LLMResponse(role="assistant", completion_text="已查看视频帧"),
+    ]
+    if invalid_first:
+        responses.insert(
+            0,
+            LLMResponse(
+                role="assistant",
+                tools_call_name=[tool_name],
+                tools_call_args=[{**arguments, "times_sec": []}],
+                tools_call_ids=["call_invalid_video"],
+            ),
+        )
     provider = SimpleNamespace(
         provider_config={"id": "test", "modalities": ["image", "tool_use"]},
-        text_chat=AsyncMock(
-            side_effect=[
-                LLMResponse(
-                    role="assistant",
-                    tools_call_name=[tool_name],
-                    tools_call_args=[arguments],
-                    tools_call_ids=["call_video"],
-                ),
-                LLMResponse(role="assistant", completion_text="已查看视频帧"),
-            ]
-        ),
+        text_chat=AsyncMock(side_effect=responses),
     )
 
     class Hooks(BaseAgentRunHooks):
@@ -190,16 +329,24 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         tool_executor=FunctionToolExecutor(),
         agent_hooks=Hooks(),
     )
-    async for _ in runner.step_until_done(2):
+    async for _ in runner.step_until_done(len(responses)):
         pass
-    assert provider.text_chat.await_count == 2
+    assert provider.text_chat.await_count == len(responses)
     messages = [
         Message.model_validate(message)
         for message in provider.text_chat.await_args.kwargs["contexts"]
     ]
-    tool_result = next(message for message in messages if message.role == "tool")
-    metadata = json.loads(tool_result.content)
+    results = [
+        json.loads(message.content) for message in messages if message.role == "tool"
+    ]
+    if invalid_first:
+        assert results[0]["error"]["code"] == "INVALID_ARGUMENT"
+        assert results[0]["remaining_inspect_calls"] == 3
+        assert results[0]["error"]["examples"]
+    metadata = results[-1]
     assert metadata["success"]
+    if tool_name == "video_inspect":
+        assert metadata["remaining_inspect_calls"] == 2
     image_message = next(
         message
         for message in messages
@@ -214,10 +361,9 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         "frames"
     ]
     for image in images:
-        assert (
-            base64.b64decode(image.image_url.url.split(",", 1)[1])
-            == Path(image.image_url.id).read_bytes()
-        )
+        assert base64.b64decode(
+            image.image_url.url.split(",", 1)[1]
+        ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     serialized = json.dumps([message.model_dump() for message in messages])
     assert "Image returned and cached" not in serialized
     assert "Review the image below" not in serialized
@@ -274,10 +420,9 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     assert len(images) == data(result)["new_frame_count"] > 0
     for image in images:
         assert image.image_url.url.startswith("data:image/jpeg;base64,")
-        assert (
-            base64.b64decode(image.image_url.url.split(",", 1)[1])
-            == Path(image.image_url.id).read_bytes()
-        )
+        assert base64.b64decode(
+            image.image_url.url.split(",", 1)[1]
+        ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     assert [
         json.loads(part.text)
         for part in event.agent_context.messages[-1].content
@@ -291,7 +436,7 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     assert all(content.type == "text" for content in again.content)
     assert image_parts(event) == images
     inspect = await plugin.video_inspect(
-        event, str(sample_video), timestamps_sec=[0.5], max_edge=128
+        event, str(sample_video), mode="timestamps", times_sec=[0.5], max_edge=128
     )
     assert not inspect.isError
     assert data(inspect)["remaining_inspect_calls"] == 2
@@ -320,7 +465,8 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert call["chat_provider_id"] == "configured-vision"
     assert call["contexts"] == [] and call["tools"] is None
     assert len(call["image_urls"]) == len(overview["frames"])
-    assert all(Path(path).is_file() for path in call["image_urls"])
+    for path in call["image_urls"]:
+        assert await asyncio.to_thread(Path(path).is_file)
     prompt_data = json.loads(call["prompt"].split("\n", 1)[1])
     assert prompt_data["user_question"] == question
     assert prompt_data["frames"] == overview["frames"]
@@ -329,7 +475,7 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert not image_parts(event)
 
     inspected = await plugin.video_inspect(
-        event, str(sample_video), timestamps_sec=[0], max_edge=640
+        event, str(sample_video), mode="timestamps", times_sec=[0], max_edge=640
     )
     assert not inspected.isError
     assert all(content.type == "text" for content in inspected.content)
@@ -482,15 +628,47 @@ async def test_replaced_or_expired_attachment_loses_authorization(plugin, sample
     assert result.isError
 
 
-async def test_inspect_budget_is_per_question_and_counts_failures(plugin, sample_video):
+async def test_invalid_inspect_arguments_preserve_budget_and_examples_work(
+    plugin, sample_video
+):
     event = Event(admin=True)
-    for _ in range(3):
+    for mode, times in (
+        (None, None),
+        ("range", [0]),
+        ("range", [1, 0]),
+        ("timestamps", []),
+        ("timestamps", [-1]),
+        ("timestamps", [99]),
+    ):
         result = await plugin.video_inspect(
-            event, str(sample_video), timestamps_sec=[-1]
+            event, str(sample_video), mode=mode, times_sec=times
         )
         assert result.isError
+        assert data(result)["error"]["code"] == "INVALID_ARGUMENT"
+        assert data(result)["remaining_inspect_calls"] == 3
+        assert not image_parts(event)
+    for example in data(result)["error"]["examples"]:
+        validate(example, llm_tools.get_func("video_inspect").parameters)
+        corrected = await plugin.video_inspect(event, **example)
+        assert not corrected.isError
+    assert plugin._state(event)["inspect_calls"] == 2
+
+
+async def test_inspect_budget_is_per_question_and_counts_processing_failures(
+    plugin, sample_video
+):
+    event = Event(admin=True)
+    plugin.service.inspect = AsyncMock(side_effect=VideoError("抽帧失败"))
+    for remaining in (2, 1, 0):
+        result = await plugin.video_inspect(
+            event, str(sample_video), mode="timestamps", times_sec=[0]
+        )
+        assert result.isError
+        assert data(result)["remaining_inspect_calls"] == remaining
     plugin.service.inspect = AsyncMock()
-    rejected = await plugin.video_inspect(event, str(sample_video), timestamps_sec=[1])
+    rejected = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[1]
+    )
     assert rejected.isError
     assert "用尽" in data(rejected)["error"]["message"]
     plugin.service.inspect.assert_not_called()
@@ -527,7 +705,9 @@ async def test_unload_cancels_running_tools(plugin, sample_video):
 
     plugin.service.inspect = delayed
     task = asyncio.create_task(
-        plugin.video_inspect(Event(admin=True), str(sample_video), timestamps_sec=[1])
+        plugin.video_inspect(
+            Event(admin=True), str(sample_video), mode="timestamps", times_sec=[1]
+        )
     )
     await started.wait()
     await plugin.terminate()

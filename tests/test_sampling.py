@@ -4,6 +4,7 @@ import pytest
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.sampling import (
     Candidate,
+    InspectArgumentError,
     inspect_timestamps,
     maximum_gap,
     overview_candidates,
@@ -88,32 +89,44 @@ def test_invalid_settings_rejected(values):
 
 
 def test_inspect_range_uses_short_window_and_endpoints():
-    points, _ = inspect_timestamps(100, 99.9, 10, 14, None, 8)
+    points, request = inspect_timestamps(100, 99.9, "range", [10, 14], 8)
     assert len(points) == 8
     assert points[0] == 10
     assert points[-1] == 14
+    assert request == {"mode": "range", "times_sec": [10, 14]}
 
 
 @pytest.mark.parametrize(
-    "start,end,points",
+    "mode,times",
     [
-        (None, None, None),
-        (10, 5, None),
-        (-1, 5, None),
-        (0, math.inf, None),
-        (0, 10, [1]),
-        (None, None, []),
-        (None, None, [True]),
-        (None, None, [float("nan")]),
-        (None, None, [101]),
-        (None, None, list(range(9))),
+        (None, None),
+        ("auto", [0]),
+        ("range", [10, 5]),
+        ("range", [-1, 5]),
+        ("range", [0, math.inf]),
+        ("range", [0]),
+        ("range", [0, 1, 2]),
+        ("range", [0, True]),
+        ("timestamps", []),
+        ("timestamps", [True]),
+        ("timestamps", [float("nan")]),
+        ("timestamps", [101]),
+        ("timestamps", list(range(9))),
+        ("timestamps", "0,1"),
     ],
 )
-def test_invalid_inspect_requests_rejected(start, end, points):
-    with pytest.raises(ValueError):
-        inspect_timestamps(100, 99.9, start, end, points, 8)
+def test_invalid_inspect_requests_rejected(mode, times):
+    with pytest.raises(InspectArgumentError):
+        inspect_timestamps(100, 99.9, mode, times, 8)
 
 
 def test_point_mode_deduplicates_and_sorts():
-    points, _ = inspect_timestamps(100, 99.9, None, None, [9, 3, 9], 8)
+    points, request = inspect_timestamps(100, 99.9, "timestamps", [9, 3, 9], 8)
     assert points == [3, 9]
+    assert request == {"mode": "timestamps", "times_sec": [9, 3, 9]}
+
+
+@pytest.mark.parametrize("mode,times", [("range", [0, 0]), ("timestamps", [0])])
+def test_zero_is_a_valid_explicit_timestamp(mode, times):
+    points, _ = inspect_timestamps(100, 99.9, mode, times, 8)
+    assert points == [0]

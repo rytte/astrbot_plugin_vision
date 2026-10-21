@@ -67,40 +67,43 @@ def overview_candidates(
     return sorted(candidates, key=lambda item: item.timestamp), effective_interval
 
 
+class InspectArgumentError(ValueError):
+    """回看参数不合法，尚未执行抽帧。"""
+
+
 def inspect_timestamps(
     duration: float,
     last_timestamp: float,
-    start_sec: float | None,
-    end_sec: float | None,
-    timestamps_sec: list[float] | None,
+    mode: str,
+    times_sec: list[float],
     max_frames: int,
 ) -> tuple[list[float], dict]:
-    if timestamps_sec is not None:
-        if start_sec is not None or end_sec is not None:
-            raise ValueError("时间范围与 timestamps_sec 不能同时提供")
-        if not isinstance(timestamps_sec, list) or not timestamps_sec:
-            raise ValueError("timestamps_sec 必须是非空数字列表")
-        if len(timestamps_sec) > max_frames:
-            raise ValueError(f"指定时间点数量不能超过本次帧数上限 {max_frames}")
-        points = timestamps_sec
-        request = {"timestamps_sec": timestamps_sec}
-    else:
-        if start_sec is None or end_sec is None:
-            raise ValueError("请提供 start_sec、end_sec，或 timestamps_sec")
-        points = [start_sec, end_sec]
-        request = {"start_sec": start_sec, "end_sec": end_sec}
+    if mode not in ("range", "timestamps"):
+        raise InspectArgumentError(
+            'mode 必须是 "range" 或 "timestamps"；'
+            "range 的 times_sec 为 [起始秒, 结束秒]，"
+            "timestamps 的 times_sec 为非空时间点列表"
+        )
+    if not isinstance(times_sec, list) or not times_sec:
+        raise InspectArgumentError("times_sec 必须是非空数字列表")
+    if mode == "range" and len(times_sec) != 2:
+        raise InspectArgumentError("range 模式的 times_sec 必须恰好包含起始秒和结束秒")
+    if mode == "timestamps" and len(times_sec) > max_frames:
+        raise InspectArgumentError(f"指定时间点数量不能超过本次帧数上限 {max_frames}")
     if any(
         isinstance(value, bool)
         or not isinstance(value, int | float)
         or not math.isfinite(value)
         or not 0 <= value <= duration
-        for value in points
+        for value in times_sec
     ):
-        raise ValueError(f"时间必须是 0～{duration:.3f} 秒之间的有限数字")
-    if timestamps_sec is not None:
-        return sorted(set(float(value) for value in points)), request
+        raise InspectArgumentError(f"时间必须是 0～{duration:.3f} 秒之间的有限数字")
+    request = {"mode": mode, "times_sec": times_sec}
+    if mode == "timestamps":
+        return sorted(set(float(value) for value in times_sec)), request
+    start_sec, end_sec = times_sec
     if start_sec > end_sec:
-        raise ValueError("start_sec 不能大于 end_sec")
+        raise InspectArgumentError("range 模式的起始秒不能大于结束秒")
     if start_sec == end_sec or max_frames == 1:
         return [float(start_sec)], request
     endpoint = max(float(start_sec), min(float(end_sec), last_timestamp))

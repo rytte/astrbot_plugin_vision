@@ -78,5 +78,5 @@ async def test_failed_scene_scan_falls_back_to_uniform():
 async def test_invalid_model_limits_rejected(arguments):
     with pytest.raises(ValueError):
         await VideoService(FakeMedia()).inspect(
-            "video.mp4", start_sec=0, end_sec=1, **arguments
+            "video.mp4", mode="range", times_sec=[0, 1], **arguments
         )

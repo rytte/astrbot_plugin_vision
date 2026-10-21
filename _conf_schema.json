@@ -10,7 +10,7 @@
   "inspect_max_frames": {"type": "int", "description": "单次回看帧数上限", "default": 8},
   "inspect_max_edge": {"type": "int", "description": "回看默认图片长边（像素）", "default": 768},
   "max_edge_limit": {"type": "int", "description": "模型请求图片长边的硬上限（像素）", "default": 1280},
-  "inspect_max_calls": {"type": "int", "description": "单个问题的回看次数上限", "hint": "同一问题中所有视频共享次数，执行失败也计入；新消息重新计数。", "default": 3},
+  "inspect_max_calls": {"type": "int", "description": "单个问题的回看次数上限", "hint": "同一问题中所有视频共享次数；参数校验失败返还次数，处理失败或超时仍计入；新消息重新计数。", "default": 3},
   "tool_timeout": {"type": "float", "description": "单次工具调用总超时（秒）", "default": 300.0},
   "max_concurrency": {"type": "int", "description": "并发处理与子进程数量上限", "default": 2},
   "cache_ttl": {"type": "float", "description": "抽帧缓存与会话授权有效期（秒）", "default": 3600.0},

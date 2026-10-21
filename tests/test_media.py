@@ -79,7 +79,11 @@ async def test_real_overview_and_inspect(media, sample_video):
     assert overview.frames[-1].timestamp_sec >= 2.8
     assert any(frame.reason == "scene_change" for frame in overview.frames)
     result = await service.inspect(
-        str(sample_video), start_sec=0.8, end_sec=1.2, max_frames=4, max_edge=128
+        str(sample_video),
+        mode="range",
+        times_sec=[0.8, 1.2],
+        max_frames=4,
+        max_edge=128,
     )
     assert 1 <= len(result.frames) <= 4
     assert all(frame.width <= 128 for frame in result.frames)
@@ -143,7 +147,11 @@ def test_cache_cleanup_does_not_delete_source(media, sample_video):
 async def test_model_requested_limits_are_clamped(media, sample_video):
     service = VideoService(media)
     result = await service.inspect(
-        str(sample_video), start_sec=0, end_sec=1, max_frames=100, max_edge=10000
+        str(sample_video),
+        mode="range",
+        times_sec=[0, 1],
+        max_frames=100,
+        max_edge=10000,
     )
     assert result.data["effective_max_frames"] == 8
     assert result.data["effective_max_edge"] == 1280

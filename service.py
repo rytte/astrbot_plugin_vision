@@ -6,7 +6,13 @@ from collections import Counter
 from dataclasses import dataclass
 
 from .media import FFmpegMedia, Frame, VideoError, VideoInfo
-from .sampling import Candidate, inspect_timestamps, maximum_gap, overview_candidates
+from .sampling import (
+    Candidate,
+    InspectArgumentError,
+    inspect_timestamps,
+    maximum_gap,
+    overview_candidates,
+)
 
 
 @dataclass
@@ -132,9 +138,8 @@ class VideoService:
     async def inspect(
         self,
         video_path: str,
-        start_sec: float | None = None,
-        end_sec: float | None = None,
-        timestamps_sec: list[float] | None = None,
+        mode: str,
+        times_sec: list[float],
         max_frames: int | None = None,
         max_edge: int | None = None,
     ) -> VideoResult:
@@ -146,7 +151,7 @@ class VideoService:
                 or int(value) != value
                 or value <= 0
             ):
-                raise ValueError(f"{name} 必须是正整数")
+                raise InspectArgumentError(f"{name} 必须是正整数或 null（使用配置值）")
         frame_limit = min(
             max_frames or self.settings.inspect_max_frames,
             self.settings.inspect_max_frames,
@@ -155,14 +160,13 @@ class VideoService:
             max_edge or self.settings.inspect_max_edge, self.settings.max_edge_limit
         )
         if edge_limit < 64:
-            raise ValueError("max_edge 不能小于 64")
+            raise InspectArgumentError("max_edge 不能小于 64")
         info = await self.media.probe(video_path)
         timestamps, request = inspect_timestamps(
             info.duration,
             info.last_timestamp,
-            start_sec,
-            end_sec,
-            timestamps_sec,
+            mode,
+            times_sec,
             int(frame_limit),
         )
         frames = await self._extract_many(
