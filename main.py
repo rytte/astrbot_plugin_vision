@@ -10,8 +10,10 @@ from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File, Reply, Video
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.agent.message import ImageURLPart, Message, TextPart
+from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_temp_path
-from mcp.types import CallToolResult, ImageContent, TextContent
+from mcp.types import CallToolResult, TextContent
 
 from .config import Settings
 from .media import FFmpegMedia, VideoError
@@ -66,6 +68,19 @@ class VisionPlugin(Star):
             logger.warning("视频理解依赖检查失败：%s", exc)
         else:
             logger.info("视频理解已就绪，工具：video_overview、video_inspect")
+
+    @filter.on_agent_begin()
+    async def bind_agent_context(
+        self, event: AstrMessageEvent, run_context: ContextWrapper
+    ) -> None:
+        event.set_extra("vision_agent_context", run_context)
+
+    @filter.on_agent_done()
+    async def release_agent_context(
+        self, event: AstrMessageEvent, run_context: ContextWrapper, llm_response
+    ) -> None:
+        if event.get_extra("vision_agent_context") is run_context:
+            event.set_extra("vision_agent_context", None)
 
     def _state(self, event: AstrMessageEvent) -> dict:
         state = event.get_extra("vision_request_state")
@@ -203,6 +218,14 @@ class VisionPlugin(Star):
                             "当前问题的回看次数已用尽，请基于现有证据回答；不足之处应明确说明"
                         )
                     state["inspect_calls"] += 1
+                image_context = None
+                if action == "inspect" or not self.settings.overview_provider_id:
+                    image_context = event.get_extra("vision_agent_context")
+                    if image_context is None:
+                        raise VideoError(
+                            "视频帧需要 AstrBot 内置 Agent 的运行上下文；"
+                            "请使用内置 Agent 并确保本插件的 on_agent_begin 钩子正常执行"
+                        )
                 operation = (
                     self.service.overview(str(path))
                     if action == "overview"
@@ -236,30 +259,40 @@ class VisionPlugin(Star):
                 result.data["remaining_inspect_calls"] = max(
                     0, self.settings.inspect_max_calls - state["inspect_calls"]
                 )
-                content = [
-                    TextContent(
-                        type="text", text=json.dumps(result.data, ensure_ascii=False)
-                    )
-                ]
+                image_parts = []
                 for frame in frames:
                     image_bytes = await asyncio.to_thread(frame.path.read_bytes)
-                    content.extend(
+                    image_parts.extend(
                         [
-                            TextContent(
-                                type="text",
+                            TextPart(
                                 text=json.dumps(frame.metadata(), ensure_ascii=False),
                             ),
-                            ImageContent(
-                                type="image",
-                                mimeType="image/jpeg",
-                                data=base64.b64encode(image_bytes).decode("ascii"),
+                            ImageURLPart(
+                                image_url=ImageURLPart.ImageURL(
+                                    url="data:image/jpeg;base64,"
+                                    + base64.b64encode(image_bytes).decode("ascii"),
+                                    id=str(frame.path),
+                                ),
                             ),
                         ]
+                    )
+                if image_parts:
+                    # ImageContent 会触发核心添加“满意后发给用户”的通用提示。
+                    # 直接加入当前 Agent 上下文，保留真实图片和逐帧时间戳。
+                    image_context.messages.append(
+                        Message(role="user", content=image_parts)
                     )
                 state["seen"].update(frame.frame_id for frame in frames)
                 if action == "overview":
                     state["overviews"].add(identity)
-                return CallToolResult(content=content)
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=json.dumps(result.data, ensure_ascii=False),
+                        )
+                    ]
+                )
         except PermissionError as exc:
             code, message = "PERMISSION_DENIED", str(exc)
         except (TypeError, ValueError) as exc:

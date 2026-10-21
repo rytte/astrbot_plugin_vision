@@ -61,8 +61,6 @@ class Frame:
             "timestamp_sec": self.timestamp_sec,
             "requested_sec": self.requested_sec,
             "reason": self.reason,
-            "width": self.width,
-            "height": self.height,
         }
 
 
