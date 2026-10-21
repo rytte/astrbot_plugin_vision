@@ -991,3 +991,90 @@ async def test_unload_cancels_running_tools(plugin, sample_video):
     await plugin.terminate()
     assert task.cancelled()
     assert not plugin.tasks and not plugin.media.processes
+
+
+def enable_grid(plugin):
+    plugin.settings = replace(
+        plugin.settings,
+        overview_output_mode="grid",
+        overview_interval=0.2,
+        overview_max_frames=40,
+        overview_max_edge=128,
+    )
+    plugin.media.settings = plugin.service.settings = plugin.settings
+
+
+async def test_grid_overview_sends_pngs_and_keeps_inspect_independent(
+    plugin, sample_video
+):
+    enable_grid(plugin)
+    event = Event(admin=True)
+    result = await plugin.video_overview(event, str(sample_video))
+    assert not result.isError
+    overview = data(result)
+    assert overview["presentation"]["mode"] == "grid"
+    record_tool_result(event, "video_overview", result)
+    images = image_parts(event)
+    assert len(images) == overview["submitted_image_count"] >= 2
+    assert len(images) < overview["new_frame_count"]
+    assert all(
+        image.image_url.url.startswith("data:image/png;base64,") for image in images
+    )
+    cells = [
+        cell for image in overview["presentation"]["images"] for cell in image["cells"]
+    ]
+    assert [cell["frame_id"] for cell in cells] == [
+        frame["frame_id"] for frame in overview["frames"]
+    ]
+    assert plugin._state(event)["seen"] == {frame["frame_id"] for frame in cells}
+    inspected = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[0], max_edge=256
+    )
+    assert not inspected.isError
+    assert data(inspected)["presentation"]["mode"] == "frames"
+    record_tool_result(event, "video_inspect", inspected)
+    assert image_parts(event)[-1].image_url.url.startswith("data:image/jpeg;base64,")
+
+
+async def test_grid_omits_already_seen_frames_and_updates_cell_numbers(
+    plugin, sample_video
+):
+    enable_grid(plugin)
+    event = Event(admin=True)
+    inspected = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[0], max_edge=128
+    )
+    assert not inspected.isError
+    record_tool_result(event, "video_inspect", inspected)
+    seen = data(inspected)["frames"][0]["frame_id"]
+    result = await plugin.video_overview(event, str(sample_video))
+    assert not result.isError
+    overview = data(result)
+    assert [frame["frame_id"] for frame in overview["skipped_already_seen"]] == [seen]
+    cells = [
+        cell for image in overview["presentation"]["images"] for cell in image["cells"]
+    ]
+    assert seen not in {cell["frame_id"] for cell in cells}
+    assert [cell["frame_number"] for cell in cells] == list(range(1, len(cells) + 1))
+    assert len(cells) == overview["new_frame_count"]
+
+
+async def test_delegated_model_receives_grid_with_frame_mapping(
+    delegated_plugin, sample_video
+):
+    plugin = delegated_plugin
+    enable_grid(plugin)
+    event = Event(admin=True)
+    result = await plugin.video_overview(event, str(sample_video))
+    assert not result.isError
+    overview = data(result)
+    call = plugin.context.llm_generate.await_args.kwargs
+    assert overview["overview_mode"] == "delegated"
+    assert overview["submitted_frame_count"] > overview["submitted_image_count"] >= 2
+    assert len(call["image_urls"]) == overview["submitted_image_count"]
+    assert all(Path(path).suffix == ".png" for path in call["image_urls"])
+    prompt = json.loads(call["prompt"].split("\n", 1)[1])
+    assert prompt["presentation"] == overview["presentation"]
+    assert "从左到右" in call["prompt"]
+    assert not image_parts(event)
+    assert not plugin._state(event)["seen"]

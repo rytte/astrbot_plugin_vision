@@ -89,6 +89,44 @@ async def test_real_debug_steps_preview_and_isolation(sessions, sample_video):
     assert sample_video.read_bytes() == source_bytes
 
 
+async def test_grid_debug_output_preview_metadata_and_reset(sessions, sample_video):
+    import base64
+
+    session = await sessions.upload("admin", Upload(sample_video.read_bytes()))
+    await sessions.reset(session, {"overview_output_mode": "grid"})
+    with pytest.raises(ValueError, match="尚未生成"):
+        await sessions.image(session, "grid", 0, "full", session.revision)
+    while not session.pipeline.done:
+        await sessions.next(session, session.pipeline.completed, session.revision)
+        await session.task
+        assert session.error is None
+    snapshot = sessions.snapshot(session)
+    presentation = snapshot["result"]["presentation"]
+    assert snapshot["parameters"]["overview_output_mode"] == "grid"
+    assert presentation["image_count"] < presentation["frame_count"]
+    assert snapshot["result"]["output_image_bytes"] == presentation["total_bytes"]
+    preview = await sessions.image(session, "grid", 0, "full", session.revision)
+    assert preview["data_url"].startswith("data:image/png;base64,")
+    with Image.open(
+        io.BytesIO(base64.b64decode(preview["data_url"].split(",")[1]))
+    ) as image:
+        assert image.size == (preview["image"]["width"], preview["image"]["height"])
+    thumbnail = await sessions.image(session, "grid", 0, "thumb", session.revision)
+    with Image.open(
+        io.BytesIO(base64.b64decode(thumbnail["data_url"].split(",")[1]))
+    ) as image:
+        assert image.width <= 480 and image.height <= 360
+    with pytest.raises(ValueError):
+        await sessions.image(session, "grid", 0, "source", session.revision)
+    with pytest.raises(ValueError):
+        await sessions.image(session, "grid", 999, "full", session.revision)
+    paths = [image.path for image in session.pipeline.result.images]
+    assert all(path.is_file() for path in paths)
+    await sessions.reset(session, {"overview_output_mode": "frames"})
+    assert not any(path.exists() for path in paths)
+    assert not list(session.pipeline.media.cache_dir.iterdir())
+
+
 async def test_cancellation_keeps_current_stage_retryable(sessions):
     session = await sessions.upload("admin", Upload(b"video"))
     started = asyncio.Event()

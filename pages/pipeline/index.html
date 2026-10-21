@@ -32,6 +32,7 @@
             <label class="field" for="overview_max_frames">帧数预算 <span>2–500 帧</span><input id="overview_max_frames" name="overview_max_frames" type="number" min="2" max="500" step="1" required value="200"></label>
             <label class="field" for="overview_max_edge">输出长边 <span id="edge-hint">像素</span><input id="overview_max_edge" name="overview_max_edge" type="number" min="64" max="1280" step="1" required value="640"></label>
             <label class="field" for="scene_threshold">场景阈值 <span>越低越敏感</span><input id="scene_threshold" name="scene_threshold" type="number" min="0.000001" max="0.999999" step="any" required value="0.3"></label>
+            <label class="field" for="overview_output_mode">概览输出<select id="overview_output_mode" name="overview_output_mode"><option value="frames">独立帧</option><option value="grid">九宫格 · 保留单帧分辨率</option></select></label>
             <button id="reset" class="button full" type="submit" disabled>应用参数并从头重跑</button>
           </form>
           <p class="small muted">修改参数后点击重跑。全局插件配置保持原值。</p>

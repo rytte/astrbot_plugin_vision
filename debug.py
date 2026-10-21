@@ -24,6 +24,7 @@ PARAMETERS = (
     "overview_max_frames",
     "overview_max_edge",
     "scene_threshold",
+    "overview_output_mode",
 )
 VIDEO_SUFFIXES = {
     ".mp4",
@@ -102,7 +103,9 @@ class DebugSessions:
 
     def settings(self, values: dict) -> Settings:
         if not isinstance(values, dict) or set(values) - set(PARAMETERS):
-            raise ValueError("仅支持本次概览间隔、帧数预算、输出尺寸和场景阈值")
+            raise ValueError(
+                "仅支持本次概览间隔、帧数预算、输出尺寸、场景阈值和图片输出模式"
+            )
         return Settings.from_mapping({**asdict(self.media.settings), **values})
 
     def _active(self, session: DebugSession) -> None:
@@ -283,6 +286,9 @@ class DebugSessions:
             result["total_image_bytes"] = sum(
                 frame.path.stat().st_size for frame in pipeline.kept
             )
+            result["output_image_bytes"] = pipeline.result.data["presentation"][
+                "total_bytes"
+            ]
         return {
             "id": session.id,
             "filename": session.filename,
@@ -335,6 +341,31 @@ class DebugSessions:
         self, session: DebugSession, kind: str, index: int, variant: str
     ) -> dict:
         pipeline = session.pipeline
+        if kind == "grid":
+            if (
+                not pipeline.result
+                or pipeline.settings.overview_output_mode != "grid"
+                or not 0 <= index < len(pipeline.result.images)
+                or variant not in {"thumb", "full"}
+            ):
+                raise ValueError("九宫格尚未生成、索引或图片类型无效")
+            started = time.monotonic()
+            try:
+                image = pipeline.result.images[index]
+                buffer = io.BytesIO()
+                if variant == "thumb":
+                    with Image.open(image.path) as source:
+                        source.thumbnail((480, 360))
+                        source.save(buffer, format="PNG")
+                else:
+                    buffer.write(image.path.read_bytes())
+                return {
+                    "data_url": "data:image/png;base64,"
+                    + base64.b64encode(buffer.getvalue()).decode(),
+                    "image": {**image.metadata(), "bytes": image.path.stat().st_size},
+                }
+            finally:
+                session.preview_elapsed += time.monotonic() - started
         groups = {
             "fixed": pipeline.fixed,
             "scene": pipeline.scenes,

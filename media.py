@@ -453,7 +453,10 @@ class FFmpegMedia:
         files = []
         now = time.time()
         for path in self.cache_dir.iterdir():
-            if path.suffix not in (".jpg", ".json", ".tmp") or path.is_symlink():
+            if (
+                path.suffix not in (".jpg", ".png", ".json", ".tmp")
+                or path.is_symlink()
+            ):
                 continue
             try:
                 stat = path.stat()

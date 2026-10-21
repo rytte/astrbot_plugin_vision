@@ -3,7 +3,7 @@
 const $ = id => document.getElementById(id);
 const stageTitles = ["视频探测", "场景检测", "两路候选", "候选预合并", "抽帧与压缩", "邻近去重", "最终输出"];
 const reasonNames = {boundary: "首尾边界", interval: "固定间隔", scene_change: "场景变化", debug_preview: "调试预览"};
-const parameterNames = ["overview_interval", "overview_max_frames", "overview_max_edge", "scene_threshold"];
+const parameterNames = ["overview_interval", "overview_max_frames", "overview_max_edge", "scene_threshold", "overview_output_mode"];
 let bridge, config, session = null, view = -1, busy = false, pollTimer = null, previewTimer = null;
 let videoURL = null, selectedVideoSession = null, dialogVersion = 0, pairIndex = 0;
 let renderKey = "", activeImages = 0;
@@ -32,7 +32,7 @@ function message(text, error = false) {
 function remember(id) { try { if (id) localStorage.setItem("vision-debug-session", id); else localStorage.removeItem("vision-debug-session"); } catch {} }
 function remembered() { try { return localStorage.getItem("vision-debug-session"); } catch { return null; } }
 function params() {
-  return Object.fromEntries(parameterNames.map(key => [key, Number($(key).value)]));
+  return Object.fromEntries(parameterNames.map(key => [key, key === "overview_output_mode" ? $(key).value : Number($(key).value)]));
 }
 function setParams(values) { for (const key of parameterNames) $(key).value = values[key]; }
 function note(parent, text, warning = false) { parent.append(node("div", "note" + (warning ? " warning" : ""), text)); }
@@ -267,6 +267,13 @@ function renderOutput(parent) {
   stats(parent, [["最终输出", sampling.returned_count + " 帧"], ["最大时间空隙", time(sampling.actual_max_gap_sec)], ["图片总体积", bytes(result.total_image_bytes)], ["流水线耗时", time(session.processing_seconds)]]);
   const sources = Object.entries(sampling.reason_counts).map(([key, count]) => (reasonNames[key] || key) + " " + count + " 帧").join(" · ");
   note(parent, sources + "。最终输出与聊天工具共用同一条处理流水线；本页测试止于图片输出，不调用看图模型。");
+  const presentation = result.presentation;
+  stats(parent, [["概览输出模式", presentation.mode === "grid" ? "九宫格" : "独立帧"], ["实际发送图片", presentation.image_count + " 张"], ["输出图片体积", bytes(presentation.total_bytes)], ["输出总像素", number(presentation.total_pixels / 1000000, 2) + " MP"]]);
+  if (presentation.mode === "grid") {
+    note(parent, "每组最多 9 帧，按从左到右、从上到下阅读。拼接保留正式抽帧后的像素尺寸，以 PNG 无损保存，编号与实际时间戳位于画面外；不足 9 帧紧凑排列。下方缩略图仅供预览，点击可按原始像素查看发送图片。");
+    gallery(parent, "九宫格输出", presentation.images, "grid", "thumb", 6);
+    note(parent, "图片数量减少不代表视觉 token 一定减少；模型可能再次缩放大图。本页不调用模型，不估算 token。详细回看仍返回独立帧。");
+  }
   const items = session.kept_indices.map(index => ({...session.frames[index], assetIndex: index}));
   gallery(parent, "最终保留帧", items, "frame");
   const actions = node("div", "inline-actions"); actions.append(button("导出调试记录 JSON", exportRecord)); parent.append(actions);
@@ -309,6 +316,7 @@ function gallery(parent, title, items, kind, variant = "thumb", size = 24) {
   }; draw();
 }
 function frameCard(item, kind, index, variant = "thumb") {
+  if (kind === "grid") return gridCard(item, index);
   const card = button("", () => showFrame(kind, index, variant), "frame-card " + (item.reason === "scene_change" ? "scene" : item.reason));
   const imageBox = node("div", "frame-image"), placeholder = node("span", "placeholder", "按需加载预览"), image = node("img");
   image.alt = "视频 " + time(item.timestamp_sec ?? item.timestamp) + " 的画面";
@@ -320,6 +328,18 @@ function frameCard(item, kind, index, variant = "thumb") {
   card.append(imageBox, meta);
   const capture = {id: session.id, revision: session.revision};
   imageBox._load = () => getImage(capture, kind, index, variant).then(data => {image.src = data.data_url; placeholder.remove(); if (kind !== "frame") meta.append(node("p", "", "实际 " + time(data.frame.timestamp_sec)));}).catch(() => {placeholder.textContent = "预览失败，点击重试";});
+  observer.observe(imageBox);
+  return card;
+}
+function gridCard(item, index) {
+  const card = button("", () => showGrid(index), "frame-card");
+  const imageBox = node("div", "frame-image"), placeholder = node("span", "placeholder", "按需加载拼图"), image = node("img");
+  image.alt = "第 " + (index + 1) + " 张九宫格"; imageBox.append(placeholder, image);
+  const meta = node("div", "frame-meta"), first = item.cells[0], last = item.cells[item.cells.length - 1];
+  meta.append(node("strong", "", "拼图 " + (index + 1) + " · " + item.cells.length + " 帧"), node("p", "", item.width + "×" + item.height + " · PNG"), node("p", "", time(first.timestamp_sec) + " – " + time(last.timestamp_sec)));
+  card.append(imageBox, meta);
+  const capture = {id: session.id, revision: session.revision};
+  imageBox._load = () => getImage(capture, "grid", index, "thumb").then(data => {image.src = data.data_url; placeholder.remove();}).catch(() => {placeholder.textContent = "预览失败，点击重试";});
   observer.observe(imageBox);
   return card;
 }
@@ -357,6 +377,23 @@ function refreshPreviewTiming() {
 }
 function seek(timestamp) { if (videoURL && selectedVideoSession === session?.id) $("source-video").currentTime = timestamp; }
 function closeDialog() { dialogVersion++; if ($("image-dialog").open) $("image-dialog").close(); }
+async function showGrid(index) {
+  const version = ++dialogVersion, capture = {id: session.id, revision: session.revision};
+  $("image-title").textContent = "九宫格输出 · 第 " + (index + 1) + " 张";
+  $("image-description").textContent = "这是实际发送给模型的 PNG，拼接时保留各帧分辨率。";
+  const content = $("image-content"); content.replaceChildren(node("p", "muted", "正在加载完整拼图…"));
+  if (!$("image-dialog").open) $("image-dialog").showModal();
+  try {
+    const data = await getImage(capture, "grid", index, "full");
+    if (version !== dialogVersion) return;
+    content.replaceChildren();
+    const viewport = node("div", "grid-viewport"), image = node("img"); image.src = data.data_url; image.alt = "带帧编号与实际时间戳的完整九宫格"; viewport.append(image);
+    const toggle = button("按原始像素查看", () => {const actual = viewport.classList.toggle("actual-size"); toggle.textContent = actual ? "适应窗口" : "按原始像素查看";});
+    const actions = node("div", "inline-actions"); actions.append(toggle); content.append(actions, viewport);
+    note(content, data.image.width + " × " + data.image.height + " · " + bytes(data.image.bytes) + " · PNG。切换为原始像素后，可滚动查看细节。");
+    table(content, "帧与格子对应关系", ["帧编号", "行 / 列", "实际时间", "单帧尺寸", "frame_id"], data.image.cells.map(cell => ["#" + cell.frame_number, cell.row + " / " + cell.column, time(cell.timestamp_sec), cell.width + "×" + cell.height, cell.frame_id]));
+  } catch (error) {if (version === dialogVersion) content.replaceChildren(node("p", "", error.message || "拼图加载失败"));}
+}
 async function showFrame(kind, index, variant) {
   const version = ++dialogVersion, capture = {id: session.id, revision: session.revision};
   const group = {fixed: session.fixed, scene: session.scenes, merged: session.candidates, frame: session.frames}[kind], item = group[index];

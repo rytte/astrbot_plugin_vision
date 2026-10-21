@@ -11,6 +11,7 @@ class Settings:
     ffprobe_path: str = ""
     allowed_video_roots: tuple[str, ...] = ()
     overview_provider_id: str = ""
+    overview_output_mode: str = "frames"
     overview_interval: float = 4.0
     overview_max_frames: int = 200
     overview_max_edge: int = 640
@@ -57,6 +58,10 @@ class Settings:
                 continue
             normalized[field.name] = value
         settings = cls(**normalized)
+        if settings.overview_output_mode not in {"frames", "grid"}:
+            raise ValueError(
+                "overview_output_mode 必须是 frames（独立帧）或 grid（九宫格）"
+            )
         if not 2 <= settings.overview_max_frames <= 500:
             raise ValueError("overview_max_frames 必须在 2～500 之间")
         if not 0 < settings.scene_threshold < 1:

@@ -20,6 +20,7 @@ from .config import Settings
 from .debug import DebugSessions
 from .debug_web import DebugWeb
 from .media import FFmpegMedia, VideoError
+from .presentation import present_frames, presentation_metadata
 from .sampling import InspectArgumentError
 from .service import VideoResult, VideoService
 from .tools import VideoInspectTool
@@ -285,19 +286,39 @@ class VisionPlugin(Star):
                 result.data["remaining_inspect_calls"] = max(
                     0, self.settings.inspect_max_calls - state["inspect_calls"]
                 )
+                output_mode = (
+                    self.settings.overview_output_mode
+                    if action == "overview"
+                    else "frames"
+                )
+                images = (
+                    result.images
+                    if result.images and len(frames) == len(result.frames)
+                    else await asyncio.wait_for(
+                        present_frames(self.media, frames, mode=output_mode),
+                        max(0.0, deadline - asyncio.get_running_loop().time()),
+                    )
+                )
+                result.data["presentation"] = presentation_metadata(output_mode, images)
+                result.data["submitted_image_count"] = len(images)
                 image_parts = []
-                for frame in frames:
-                    image_bytes = await asyncio.to_thread(frame.path.read_bytes)
+                for index, image in enumerate(images):
+                    image_bytes = await asyncio.to_thread(image.path.read_bytes)
+                    metadata = (
+                        image.metadata()
+                        if output_mode == "grid"
+                        else frames[index].metadata()
+                    )
                     image_parts.extend(
                         [
                             TextPart(
-                                text=json.dumps(frame.metadata(), ensure_ascii=False),
+                                text=json.dumps(metadata, ensure_ascii=False),
                             ),
                             ImageURLPart(
                                 image_url=ImageURLPart.ImageURL(
-                                    url="data:image/jpeg;base64,"
+                                    url=f"data:{image.mime_type};base64,"
                                     + base64.b64encode(image_bytes).decode("ascii"),
-                                    id=str(frame.path),
+                                    id=str(image.path),
                                 ),
                             ),
                         ]
@@ -399,14 +420,19 @@ class VisionPlugin(Star):
         provider_id = self.settings.overview_provider_id
         question = self._state(event)["question"] or getattr(event, "message_str", "")
         frame_metadata = [frame.metadata() for frame in result.frames]
+        images = result.images or await present_frames(self.media, result.frames)
+        presentation = presentation_metadata(self.settings.overview_output_mode, images)
         prompt = (
             "请根据以下采样信息和按顺序附上的视频帧，生成简洁的视频概览。"
-            "图片与 frames 数组一一对应，使用实际 timestamp_sec 和 frame_id 引用证据。\n"
+            "图片与 presentation.images 数组一一对应。独立帧模式每图一帧；"
+            "九宫格模式按从左到右、从上到下阅读，cells 标明每格的帧编号、位置、实际时间及 frame_id。"
+            "使用实际 timestamp_sec 和 frame_id 引用证据，标签与边框不属于原视频画面。\n"
             + json.dumps(
                 {
                     "duration_sec": result.data["duration_sec"],
                     "sampling": result.data["sampling"],
                     "frames": frame_metadata,
+                    "presentation": presentation,
                     "user_question": str(question)[:4000],
                 },
                 ensure_ascii=False,
@@ -416,7 +442,7 @@ class VisionPlugin(Star):
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                image_urls=[str(frame.path) for frame in result.frames],
+                image_urls=[str(image.path) for image in images],
                 contexts=[],
                 tools=None,
                 system_prompt=(
@@ -447,6 +473,8 @@ class VisionPlugin(Star):
                 "overview_text": text.strip(),
                 "frames": frame_metadata,
                 "submitted_frame_count": len(result.frames),
+                "submitted_image_count": len(images),
+                "presentation": presentation,
                 "new_frame_count": 0,
                 "remaining_inspect_calls": max(
                     0,

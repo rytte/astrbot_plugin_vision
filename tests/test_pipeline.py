@@ -7,12 +7,16 @@ from astrbot_plugin_vision.pipeline import STAGES, OverviewPipeline
 from astrbot_plugin_vision.service import VideoService
 
 
+@pytest.mark.parametrize("output_mode", ["frames", "grid"])
 @pytest.mark.parametrize("budget,interval", [(20, 0.5), (3, 0.5), (200, 4)])
 async def test_step_pipeline_matches_chat_output(
-    tmp_path, sample_video, budget, interval
+    tmp_path, sample_video, budget, interval, output_mode
 ):
     settings = Settings(
-        overview_max_frames=budget, overview_interval=interval, overview_max_edge=128
+        overview_max_frames=budget,
+        overview_interval=interval,
+        overview_max_edge=128,
+        overview_output_mode=output_mode,
     )
     media = FFmpegMedia(settings, tmp_path / "frames", [tmp_path])
     normal = await VideoService(media).overview(str(sample_video))
