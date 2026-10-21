@@ -17,6 +17,8 @@ from mcp.types import CallToolResult, TextContent
 
 from .agent_images import ToolImageBuffer, defer_tool_images
 from .config import Settings
+from .debug import DebugSessions
+from .debug_web import DebugWeb
 from .media import FFmpegMedia, VideoError
 from .sampling import InspectArgumentError
 from .service import VideoResult, VideoService
@@ -62,9 +64,17 @@ class VisionPlugin(Star):
         self.resources: dict[tuple[str, str], dict[str, tuple[int, int, float]]] = {}
         self.tasks: set[asyncio.Task] = set()
         self.slots = asyncio.Semaphore(self.settings.max_concurrency)
+        self.debug_sessions = DebugSessions(
+            self.media,
+            StarTools.get_data_dir("astrbot_plugin_vision") / "debug",
+            self.slots,
+        )
+        self.debug_web = DebugWeb(context, self.debug_sessions)
         self.context.add_llm_tools(VideoInspectTool(self))
 
     async def initialize(self) -> None:
+        self.debug_sessions.start()
+        self.debug_web.register()
         self.media.cleanup_cache()
         try:
             await self.media.check_dependencies()
@@ -486,6 +496,7 @@ class VisionPlugin(Star):
         )
 
     async def terminate(self) -> None:
+        await self.debug_web.close()
         tasks = list(self.tasks)
         for task in tasks:
             task.cancel()

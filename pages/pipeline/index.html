@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>视频流水线调试台</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="/api/plugin/page/bridge-sdk.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main class="app">
+    <header class="header">
+      <div><div class="eyebrow">VISION / PIPELINE LAB</div><h1>视频流水线调试台</h1><p>跟随一段视频，查看每一次采样、压缩和取舍。</p></div>
+      <span class="badge">本地 FFmpeg 处理 · 不调用模型</span>
+    </header>
+    <div id="message" role="status" aria-live="polite" hidden></div>
+    <div class="layout">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>测试视频</h2>
+          <label id="drop-zone" class="upload" for="video-file"><span class="upload-icon" aria-hidden="true">↑</span><strong>选择或拖入视频</strong><span>MP4 / MKV / MOV / WebM 等<br>最大 256 MiB</span><input id="video-file" type="file" accept="video/*,.mkv,.ts,.flv,.avi,.wmv,.ogv"></label>
+          <p id="file-name" class="filename">还没有上传视频</p>
+          <video id="source-video" controls preload="metadata" hidden></video>
+          <label class="field session-field" for="sessions">已有测试<select id="sessions"><option value="">选择测试会话</option></select></label>
+          <button id="delete" class="button subtle full" disabled>删除本次测试</button>
+        </section>
+        <section class="panel">
+          <div class="section-heading"><h2>本次参数</h2><span class="small muted">仅本次生效</span></div>
+          <form id="parameters">
+            <label class="field" for="overview_interval">采样间隔 <span>秒</span><input id="overview_interval" name="overview_interval" type="number" min="0.01" step="any" required value="4"></label>
+            <label class="field" for="overview_max_frames">帧数预算 <span>2–500 帧</span><input id="overview_max_frames" name="overview_max_frames" type="number" min="2" max="500" step="1" required value="200"></label>
+            <label class="field" for="overview_max_edge">输出长边 <span id="edge-hint">像素</span><input id="overview_max_edge" name="overview_max_edge" type="number" min="64" max="1280" step="1" required value="640"></label>
+            <label class="field" for="scene_threshold">场景阈值 <span>越低越敏感</span><input id="scene_threshold" name="scene_threshold" type="number" min="0.000001" max="0.999999" step="any" required value="0.3"></label>
+            <button id="reset" class="button full" type="submit" disabled>应用参数并从头重跑</button>
+          </form>
+          <p class="small muted">修改参数后点击重跑。全局插件配置保持原值。</p>
+        </section>
+        <div class="sidebar-note">候选小图和原分辨率对照按需生成，额外预览耗时单独记录。测试文件闲置到期后自动清理。</div>
+      </aside>
+      <div class="workspace">
+        <nav id="stages" class="stages" aria-label="处理阶段"></nav>
+        <section class="panel work-panel">
+          <div class="work-heading"><div><div id="stage-number" class="eyebrow">准备开始</div><h2 id="stage-title">从一个视频开始</h2></div><div class="actions"><button id="cancel" class="button" hidden>取消执行</button><button id="next" class="button primary" disabled>执行视频探测 →</button></div></div>
+          <div id="run-status" class="run-status" role="status" hidden></div>
+          <div id="content"><div class="empty"><div class="empty-graphic" aria-hidden="true">▤ <span>→</span> ▧ <span>→</span> ▥</div><h3>让每一帧的来去都有解释</h3><p>上传视频后，点击“下一步”逐阶段执行。<br>已完成的阶段可以随时切换查看。</p><div class="empty-tags"><span>两路候选</span><span>尺寸与压缩</span><span>逐对去重</span></div></div></div>
+        </section>
+        <footer id="timings" class="timings">处理与额外预览分别计时</footer>
+      </div>
+    </div>
+  </main>
+  <dialog id="image-dialog"><div class="dialog-heading"><div><h2 id="image-title">帧详情</h2><p id="image-description" class="small muted"></p></div><button id="close-dialog" class="button" aria-label="关闭图片详情">关闭</button></div><div id="image-content"></div></dialog>
+</body>
+</html>

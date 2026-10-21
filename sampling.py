@@ -22,6 +22,8 @@ def overview_candidates(
     interval: float,
     budget: int,
     scenes: list[Candidate],
+    *,
+    trace: list[dict] | None = None,
 ) -> tuple[list[Candidate], float]:
     last_timestamp = max(0.0, min(duration, last_timestamp))
     segment_count = max(1, math.ceil(last_timestamp / interval))
@@ -40,7 +42,14 @@ def overview_candidates(
     ]
     occupied = set()
     for candidate in sorted(scenes, key=lambda item: item.score, reverse=True):
+        decision = {"timestamp": candidate.timestamp, "score": candidate.score}
+
+        def record(action: str, **details) -> None:
+            if trace is not None:
+                trace.append({**decision, "action": action, **details})
+
         if not 0 <= candidate.timestamp <= last_timestamp:
+            record("outside", explanation="超出可抽帧时间范围")
             continue
         matching = next(
             (
@@ -56,14 +65,22 @@ def overview_candidates(
                 candidates[matching] = Candidate(
                     existing.timestamp, "scene_change", candidate.score
                 )
+            record(
+                "matched",
+                target_sec=existing.timestamp,
+                explanation="与已有候选相距小于 0.04 秒；保留时间点，边界帧保持边界标记，其余标记为场景变化",
+            )
             continue
         if len(candidates) >= budget:
+            record("budget", explanation="帧数预算已用满")
             continue
         bucket = int(candidate.timestamp / max(effective_interval, 1.0))
         if bucket in occupied:
+            record("window", explanation="该时间窗口已有更高分的场景候选")
             continue
         occupied.add(bucket)
         candidates.append(candidate)
+        record("added", explanation="加入场景候选")
     return sorted(candidates, key=lambda item: item.timestamp), effective_interval
 
 

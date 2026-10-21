@@ -93,9 +93,12 @@ def plugin(tmp_path, monkeypatch):
         lambda name: tmp_path / "plugin",
     )
     context = SimpleNamespace(
-        llm_generate=AsyncMock(), provider_manager=SimpleNamespace(llm_tools=llm_tools)
+        llm_generate=AsyncMock(),
+        provider_manager=SimpleNamespace(llm_tools=llm_tools),
+        registered_web_apis=[],
     )
     context.add_llm_tools = lambda *tools: Context.add_llm_tools(context, *tools)
+    context.register_web_api = lambda *args: Context.register_web_api(context, *args)
     return VisionPlugin(context, {})
 
 

@@ -76,6 +76,7 @@ class FFmpegMedia:
         self.ffprobe = settings.ffprobe_path or shutil.which("ffprobe") or ""
         self.processes: set[asyncio.subprocess.Process] = set()
         self.slots = asyncio.Semaphore(settings.max_concurrency)
+        self.cache_limit_bytes: int | None = None
 
     def resolve_path(self, video_path: str) -> Path:
         if not isinstance(video_path, str) or not video_path.strip():
@@ -212,26 +213,36 @@ class FFmpegMedia:
             raise VideoError("文件没有可读取的视频流，或缺少有效时长") from exc
         return VideoInfo(path, key, duration, width, height, fps, origin)
 
-    async def scenes(self, info: VideoInfo) -> list[Candidate]:
-        cache = (
-            self.cache_dir / f"{info.key}_scene_{self.settings.scene_threshold}.json"
+    async def scenes(
+        self, info: VideoInfo, *, trace: dict | None = None
+    ) -> list[Candidate]:
+        bucket_size = max(
+            self.settings.overview_interval,
+            info.duration / (self.settings.overview_max_frames * 4),
+        )
+        # 窗口取决于间隔和预算，调参时不能复用不同窗口的筛选结果。
+        cache = self.cache_dir / (
+            f"{info.key}_scene_v2_{self.settings.scene_threshold}_{bucket_size}"
+            f"{'_trace' if trace is not None else ''}.json"
         )
         if cache.is_file():
             try:
                 values = json.loads(cache.read_text(encoding="utf-8"))
                 cache.touch()
-                return [Candidate(**value) for value in values]
-            except (OSError, TypeError, ValueError):
+                if trace is not None:
+                    trace.update(values["trace"])
+                    trace["cache_hit"] = True
+                return [Candidate(**value) for value in values["candidates"]]
+            except (OSError, TypeError, ValueError, KeyError):
                 pass
-        bucket_size = max(
-            self.settings.overview_interval,
-            info.duration / (self.settings.overview_max_frames * 4),
-        )
         winners: dict[int, Candidate] = {}
+        curve: dict[int, dict] = {}
+        hits: list[dict] = []
+        scanned = hit_count = 0
         current_time = None
 
         def collect(line: str) -> None:
-            nonlocal current_time
+            nonlocal current_time, scanned, hit_count
             if match := TIMESTAMP.search(line):
                 current_time = float(match.group(1)) - info.origin
             if "lavfi.scene_score=" not in line or current_time is None:
@@ -239,6 +250,17 @@ class FFmpegMedia:
             score = float(line.split("lavfi.scene_score=", 1)[1].strip())
             if not 0 <= current_time <= info.duration:
                 return
+            scanned += 1
+            if trace is not None:
+                point = {"timestamp": round(current_time, 6), "score": score}
+                curve_bucket = min(1999, int(current_time / info.duration * 2000))
+                if curve_bucket not in curve or score > curve[curve_bucket]["score"]:
+                    curve[curve_bucket] = point
+            if score <= self.settings.scene_threshold:
+                return
+            hit_count += 1
+            if trace is not None and len(hits) < 4000:
+                hits.append(point)
             bucket = int(current_time / bucket_size)
             if bucket not in winners or score > winners[bucket].score:
                 winners[bucket] = Candidate(
@@ -267,7 +289,11 @@ class FFmpegMedia:
             "-dn",
             "-vf",
             "scale='min(iw,160)':'min(ih,160)':force_original_aspect_ratio=decrease,"
-            f"select='gt(scene,{self.settings.scene_threshold})',metadata=print",
+            + (
+                "select='gte(scene,0)',metadata=print"
+                if trace is not None
+                else f"select='gt(scene,{self.settings.scene_threshold})',metadata=print"
+            ),
             "-fps_mode",
             "vfr",
             "-f",
@@ -276,7 +302,27 @@ class FFmpegMedia:
             on_stderr=collect,
         )
         result = sorted(winners.values(), key=lambda item: item.timestamp)
-        self._write_json(cache, [asdict(candidate) for candidate in result])
+        if trace is not None:
+            selected = {candidate.timestamp for candidate in result}
+            trace.update(
+                {
+                    "cache_hit": False,
+                    "bucket_sec": bucket_size,
+                    "scanned_frames": scanned,
+                    "threshold_hits": hit_count,
+                    "curve": sorted(curve.values(), key=lambda item: item["timestamp"]),
+                    "curve_aggregated": scanned > len(curve),
+                    "hits": [
+                        {**hit, "selected": hit["timestamp"] in selected}
+                        for hit in hits
+                    ],
+                    "omitted_hits": max(0, hit_count - len(hits)),
+                }
+            )
+        self._write_json(
+            cache,
+            {"candidates": [asdict(candidate) for candidate in result], "trace": trace},
+        )
         return result
 
     def _write_json(self, target: Path, payload: object) -> None:
@@ -285,9 +331,22 @@ class FFmpegMedia:
             temporary.write_text(
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
             )
+            self._check_cache_capacity(temporary, target)
             temporary.replace(target)
         finally:
             temporary.unlink(missing_ok=True)
+
+    def _check_cache_capacity(self, temporary: Path, target: Path) -> None:
+        if self.cache_limit_bytes is None:
+            return
+        total = temporary.stat().st_size
+        for path in self.cache_dir.iterdir():
+            if path not in (temporary, target) and path.is_file():
+                total += path.stat().st_size
+        if total > self.cache_limit_bytes:
+            raise VideoError(
+                "本次调试图片缓存已达到容量上限，请减小帧数或输出尺寸后重跑"
+            )
 
     async def extract(
         self, info: VideoInfo, timestamp: float, max_edge: int, reason: str
@@ -381,6 +440,7 @@ class FFmpegMedia:
                 fingerprint,
                 quality,
             )
+            self._check_cache_capacity(temporary, image_path)
             temporary.replace(image_path)
             metadata = asdict(frame)
             metadata.pop("path")
