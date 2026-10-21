@@ -28,6 +28,10 @@ class DebugWeb:
             "state": "GET",
             "session": "GET",
             "image": "GET",
+            "model-record": "GET",
+            "model-records": "GET",
+            "model-prepare": "POST",
+            "model-run": "POST",
             "upload/<csrf_token>": "POST",
             "next": "POST",
             "reset": "POST",
@@ -107,16 +111,29 @@ class DebugWeb:
                     "max_upload_bytes": MAX_UPLOAD,
                     "max_sessions": MAX_SESSIONS,
                     "ttl_seconds": self.sessions.ttl,
+                    "providers": self.sessions.models.providers(self.context),
+                    "default_provider_id": self.sessions.media.settings.overview_provider_id,
                     "sessions": [
                         {"id": session.id, "filename": session.filename}
                         for session in self.sessions.sessions.values()
                         if session.owner == owner
                     ],
                 }
-            elif action in {"session", "image"}:
+            elif action in {"session", "image", "model-record", "model-records"}:
                 session = self.sessions.get(owner, request.query.get("id"))
                 if action == "session":
                     data = self.sessions.snapshot(session)
+                elif action == "model-record":
+                    data = self.sessions.models.detail(
+                        session, request.query.get("record")
+                    )
+                elif action == "model-records":
+                    data = {
+                        "prepared": session.model.prepared.detail()
+                        if session.model.prepared
+                        else None,
+                        "runs": [run.detail() for run in session.model.runs],
+                    }
                 else:
                     try:
                         index = int(request.query.get("index", ""))
@@ -129,6 +146,7 @@ class DebugWeb:
                         index,
                         request.query.get("variant", "thumb"),
                         revision,
+                        request.query.get("record"),
                     )
             elif action == "upload":
                 self._check_nonce(owner, csrf_token)
@@ -154,6 +172,27 @@ class DebugWeb:
                 elif action == "delete":
                     await self.sessions.delete(session)
                     return json_response({"status": "ok", "data": {"deleted": True}})
+                elif action == "model-prepare":
+                    data = await self.sessions.models.prepare(
+                        session,
+                        self.context,
+                        body.get("revision"),
+                        body.get("provider_id"),
+                        body.get("question"),
+                        body.get("mode"),
+                    )
+                    return json_response(
+                        {"status": "ok", "data": data},
+                        headers={"Cache-Control": "no-store"},
+                    )
+                elif action == "model-run":
+                    await self.sessions.models.start(
+                        session,
+                        self.context,
+                        body.get("revision"),
+                        body.get("preview_id"),
+                        body.get("run_id"),
+                    )
                 else:
                     raise ValueError("未知调试操作")
                 data = self.sessions.snapshot(session)

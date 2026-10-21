@@ -14,8 +14,10 @@ from pathlib import Path
 from PIL import Image
 
 from .config import Settings
+from .debug_models import ModelState, ModelTests
 from .media import FFmpegMedia, Frame, VideoError
 from .pipeline import STAGES, OverviewPipeline, video_metadata
+from .presentation import OutputImage
 
 MAX_UPLOAD = 256 * 1024 * 1024
 MAX_SESSIONS = 4
@@ -58,6 +60,8 @@ class DebugSession:
     preview_elapsed: float = 0
     error: str | None = None
     task: asyncio.Task | None = None
+    operation: str | None = None
+    model: ModelState = field(default_factory=ModelState)
     assets: set[asyncio.Task] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -72,6 +76,7 @@ class DebugSessions:
         self.ttl = min(media.settings.cache_ttl, 3600)
         self.closed = False
         self.janitor: asyncio.Task | None = None
+        self.models = ModelTests(self)
 
     def start(self) -> None:
         # 重载留下的临时目录已无可恢复的内存状态。
@@ -188,6 +193,7 @@ class DebugSessions:
             if session.task is not None or session.pipeline.done:
                 raise ValueError("当前阶段正在执行或流水线已完成")
             session.error = None
+            session.operation = "pipeline"
             session.task = asyncio.create_task(self._step(session))
 
     async def _step(self, session: DebugSession) -> None:
@@ -218,6 +224,7 @@ class DebugSessions:
             if started is not None:
                 session.elapsed += time.monotonic() - started
             session.task = None
+            session.operation = None
             session.touched = time.monotonic()
 
     async def _stop(self, session: DebugSession) -> None:
@@ -229,13 +236,15 @@ class DebugSessions:
         await asyncio.gather(*tasks, return_exceptions=True)
         # create_task 后立刻取消时，协程体（包括 finally）可能完全没有运行。
         session.task = None
+        session.operation = None
+        self.models.stopped(session)
         session.assets.difference_update(tasks)
         await session.pipeline.media.close()
 
     async def cancel(self, session: DebugSession) -> None:
         async with session.lock:
             self._active(session)
-            running = session.task is not None
+            running = session.task is not None and session.operation != "model"
             await self._stop(session)
             if running:
                 session.error = "已取消当前阶段，可以重试或调参重跑"
@@ -258,6 +267,7 @@ class DebugSessions:
             session.revision += 1
             session.elapsed = session.preview_elapsed = 0
             session.error = None
+            session.model = ModelState()
 
     async def delete(self, session: DebugSession) -> None:
         async with session.lock:
@@ -296,6 +306,8 @@ class DebugSessions:
             "revision": session.revision,
             "completed": pipeline.completed,
             "running": session.task is not None,
+            "operation": session.operation,
+            "model": self.models.summary(session),
             "done": pipeline.done,
             "error": session.error,
             "info": info,
@@ -304,7 +316,8 @@ class DebugSessions:
             "stages": [
                 {"id": key, "title": title, "seconds": pipeline.timings.get(key)}
                 for key, title in STAGES
-            ],
+            ]
+            + [{"id": "model", "title": "模型理解", "seconds": None}],
             "scene_trace": pipeline.scene_trace,
             "fixed": [asdict(item) for item in pipeline.fixed],
             "scenes": [asdict(item) for item in pipeline.scenes],
@@ -323,13 +336,21 @@ class DebugSessions:
         }
 
     async def image(
-        self, session: DebugSession, kind: str, index: int, variant: str, revision: int
+        self,
+        session: DebugSession,
+        kind: str,
+        index: int,
+        variant: str,
+        revision: int,
+        record: str | None = None,
     ) -> dict:
         async with session.lock:
             self._active(session)
             if revision != session.revision:
                 raise ValueError("图片属于上一次测试，请刷新页面")
-            task = asyncio.create_task(self._image(session, kind, index, variant))
+            task = asyncio.create_task(
+                self._image(session, kind, index, variant, record)
+            )
             session.assets.add(task)
         try:
             return await asyncio.wait_for(task, session.pipeline.settings.tool_timeout)
@@ -338,32 +359,26 @@ class DebugSessions:
             session.touched = time.monotonic()
 
     async def _image(
-        self, session: DebugSession, kind: str, index: int, variant: str
+        self,
+        session: DebugSession,
+        kind: str,
+        index: int,
+        variant: str,
+        record: str | None = None,
     ) -> dict:
         pipeline = session.pipeline
-        if kind == "grid":
-            if (
-                not pipeline.result
-                or pipeline.settings.overview_output_mode != "grid"
-                or not 0 <= index < len(pipeline.result.images)
-                or variant not in {"thumb", "full"}
-            ):
-                raise ValueError("九宫格尚未生成、索引或图片类型无效")
+        if kind in {"grid", "model"}:
             started = time.monotonic()
             try:
-                image = pipeline.result.images[index]
-                buffer = io.BytesIO()
-                if variant == "thumb":
-                    with Image.open(image.path) as source:
-                        source.thumbnail((480, 360))
-                        source.save(buffer, format="PNG")
-                else:
-                    buffer.write(image.path.read_bytes())
-                return {
-                    "data_url": "data:image/png;base64,"
-                    + base64.b64encode(buffer.getvalue()).decode(),
-                    "image": {**image.metadata(), "bytes": image.path.stat().st_size},
-                }
+                if kind == "model":
+                    return await self.models.image(session, record, index, variant)
+                if (
+                    not pipeline.result
+                    or pipeline.settings.overview_output_mode != "grid"
+                    or not 0 <= index < len(pipeline.result.images)
+                ):
+                    raise ValueError("九宫格尚未生成或索引无效")
+                return self._output_image(pipeline.result.images[index], variant)
             finally:
                 session.preview_elapsed += time.monotonic() - started
         groups = {
@@ -419,6 +434,25 @@ class DebugSessions:
             }
         finally:
             session.preview_elapsed += time.monotonic() - started
+
+    @staticmethod
+    def _output_image(image: OutputImage, variant: str) -> dict:
+        if variant not in {"thumb", "full"}:
+            raise ValueError("无效的图片类型")
+        buffer = io.BytesIO()
+        if variant == "thumb":
+            with Image.open(image.path) as source:
+                source.thumbnail((480, 360))
+                source.save(
+                    buffer, format="PNG" if image.mime_type == "image/png" else "JPEG"
+                )
+        else:
+            buffer.write(image.path.read_bytes())
+        return {
+            "data_url": f"data:{image.mime_type};base64,"
+            + base64.b64encode(buffer.getvalue()).decode(),
+            "image": {**image.metadata(), "bytes": image.path.stat().st_size},
+        }
 
     async def close(self) -> None:
         self.closed = True

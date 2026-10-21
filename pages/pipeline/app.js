@@ -1,13 +1,16 @@
 "use strict";
 
 const $ = id => document.getElementById(id);
-const stageTitles = ["视频探测", "场景检测", "两路候选", "候选预合并", "抽帧与压缩", "邻近去重", "最终输出"];
+const stageTitles = ["视频探测", "场景检测", "两路候选", "候选预合并", "抽帧与压缩", "邻近去重", "最终输出", "模型理解"];
 const reasonNames = {boundary: "首尾边界", interval: "固定间隔", scene_change: "场景变化", debug_preview: "调试预览"};
 const parameterNames = ["overview_interval", "overview_max_frames", "overview_max_edge", "scene_threshold", "overview_output_mode"];
 let bridge, config, session = null, view = -1, busy = false, pollTimer = null, previewTimer = null;
 let videoURL = null, selectedVideoSession = null, dialogVersion = 0, pairIndex = 0;
 let renderKey = "", activeImages = 0;
 const imageCache = new Map(), imageQueue = [], pages = new Map();
+const modelDetails = new Map();
+let modelDraft = {provider_id: "", question: "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: "frames"};
+let modelPreview = null, selectedRuns = [], pendingModelRun = null;
 
 function node(tag, className, text) {
   const element = document.createElement(tag);
@@ -64,6 +67,9 @@ function accept(data, selectLatest = false) {
   session = data;
   remember(data.id);
   if (changed) {
+    modelDetails.clear(); modelPreview = null; selectedRuns = []; pendingModelRun = null;
+    const previous = data.model.prepared || data.model.runs.at(-1)?.input;
+    modelDraft = {provider_id: previous?.provider.id || config.default_provider_id || config.providers[0]?.id || "", question: previous?.question || "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: previous?.mode || data.parameters.overview_output_mode};
     pages.clear();
     imageCache.clear();
     imageQueue.splice(0).forEach(job => job.reject(new Error("测试已切换")));
@@ -102,9 +108,9 @@ async function loadSessions() {
 }
 function updateControls() {
   const running = Boolean(session?.running), ready = Boolean(bridge && config);
-  $("next").disabled = !ready || !session || busy || running || session.done;
-  $("next").textContent = session?.done ? "全部阶段已完成" : "执行" + stageTitles[session?.completed || 0] + " →";
-  $("cancel").hidden = !running;
+  $("next").disabled = !ready || !session || busy || running || (session.done && view === 7);
+  $("next").textContent = session?.done ? (view === 7 ? "在下方调用模型" : "进入模型理解 →") : "执行" + stageTitles[session?.completed || 0] + " →";
+  $("cancel").hidden = !running && !session?.model.preparing;
   $("cancel").disabled = busy;
   $("delete").disabled = !session || busy;
   $("reset").disabled = !session || busy || running;
@@ -112,6 +118,8 @@ function updateControls() {
   $("sessions").disabled = !ready || busy || running;
   $("drop-zone").classList.toggle("busy", busy || running || !ready);
   for (const key of parameterNames) $(key).disabled = busy || running;
+  document.querySelectorAll("#model-form input, #model-form select, #model-form textarea, #model-form button").forEach(element => {element.disabled = busy || running || session?.model.preparing;});
+  if ($("model-call")) $("model-call").disabled = busy || running || session?.model.preparing || !previewMatches();
 }
 function render() {
   updateControls();
@@ -120,9 +128,9 @@ function render() {
   if (session) $("sessions").value = session.id;
   $("stages").replaceChildren();
   stageTitles.forEach((title, index) => {
-    const completed = Boolean(session && index < session.completed);
+    const completed = Boolean(session && (index < session.completed || (index === 7 && session.model.runs.some(run => run.status === "succeeded"))));
     const element = button("", () => {view = index; render();}, "stage" + (completed ? " completed" : "") + (index === view ? " active" : ""));
-    element.disabled = !completed;
+    element.disabled = !(completed || (index === 7 && session?.done));
     element.setAttribute("aria-current", index === view ? "step" : "false");
     element.append(node("span", "number", completed ? "✓" : String(index + 1)), node("span", "", title));
     $("stages").append(element);
@@ -130,11 +138,11 @@ function render() {
   const status = $("run-status");
   status.hidden = !session?.running && !session?.error;
   status.className = "run-status" + (session?.running ? " running" : " error");
-  status.textContent = session?.running ? "正在执行「" + stageTitles[session.completed] + "」…完成后停在本阶段。" : session?.error || "";
+  status.textContent = session?.running ? "正在执行「" + (session.operation === "model" ? "模型理解" : stageTitles[session.completed]) + "」…" : session?.error || "";
   if (session) {
     $("timings").replaceChildren(node("span", "", "处理累计 " + time(session.processing_seconds)), node("span", "", "额外预览累计 " + time(session.preview_seconds)), node("span", "", "闲置 " + number(config.ttl_seconds / 60, 1) + " 分钟后清理"));
   }
-  const key = [session?.id, session?.revision, session?.completed, view].join("/");
+  const key = [session?.id, session?.revision, session?.completed, view, view === 7 ? session?.model.version : ""].join("/");
   if (key === renderKey) return;
   renderKey = key;
   observer.disconnect();
@@ -147,12 +155,13 @@ function render() {
     }
     return;
   }
-  $("stage-number").textContent = "阶段 " + (view + 1) + " / 7 · " + time(session.stages[view].seconds);
+  $("stage-number").textContent = "阶段 " + (view + 1) + " / 8 · " + (view === 7 ? "按需调用" : time(session.stages[view].seconds));
   $("stage-title").textContent = stageTitles[view];
   const content = $("content");
   content.replaceChildren();
   for (const warning of session.warnings) note(content, warning, true);
-  [renderProbe, renderScenes, renderCandidates, renderMerge, renderExtract, renderDedup, renderOutput][view](content);
+  [renderProbe, renderScenes, renderCandidates, renderMerge, renderExtract, renderDedup, renderOutput, renderModel][view](content);
+  updateControls();
 }
 function renderProbe(parent) {
   const info = session.info;
@@ -266,19 +275,108 @@ function renderOutput(parent) {
   const result = session.result, sampling = result.sampling;
   stats(parent, [["最终输出", sampling.returned_count + " 帧"], ["最大时间空隙", time(sampling.actual_max_gap_sec)], ["图片总体积", bytes(result.total_image_bytes)], ["流水线耗时", time(session.processing_seconds)]]);
   const sources = Object.entries(sampling.reason_counts).map(([key, count]) => (reasonNames[key] || key) + " " + count + " 帧").join(" · ");
-  note(parent, sources + "。最终输出与聊天工具共用同一条处理流水线；本页测试止于图片输出，不调用看图模型。");
+  note(parent, sources + "。本阶段只生成图片；需要测试模型时，进入下一阶段“模型理解”。");
   const presentation = result.presentation;
   stats(parent, [["概览输出模式", presentation.mode === "grid" ? "九宫格" : "独立帧"], ["实际发送图片", presentation.image_count + " 张"], ["输出图片体积", bytes(presentation.total_bytes)], ["输出总像素", number(presentation.total_pixels / 1000000, 2) + " MP"]]);
   if (presentation.mode === "grid") {
     note(parent, "每组最多 9 帧，按从左到右、从上到下阅读。拼接保留正式抽帧后的像素尺寸，以 PNG 无损保存，编号与实际时间戳位于画面外；不足 9 帧紧凑排列。下方缩略图仅供预览，点击可按原始像素查看发送图片。");
     gallery(parent, "九宫格输出", presentation.images, "grid", "thumb", 6);
-    note(parent, "图片数量减少不代表视觉 token 一定减少；模型可能再次缩放大图。本页不调用模型，不估算 token。详细回看仍返回独立帧。");
+    note(parent, "图片数量减少不代表视觉 token 一定减少。下一阶段可以复用同一批帧，分别测试两种输出并查看模型返回的用量。详细回看仍返回独立帧。");
   }
   const items = session.kept_indices.map(index => ({...session.frames[index], assetIndex: index}));
   gallery(parent, "最终保留帧", items, "frame");
   const actions = node("div", "inline-actions"); actions.append(button("导出调试记录 JSON", exportRecord)); parent.append(actions);
   note(parent, "稀疏采样只能帮助定位。采样帧中没有出现某事件，不能证明事件没有发生。");
 }
+function previewMatches() {
+  return modelPreview && modelPreview.id === session?.model.prepared?.id && modelPreview.provider.id === modelDraft.provider_id && modelPreview.question === modelDraft.question && modelPreview.mode === modelDraft.mode;
+}
+function promptDetails(parent, input) {
+  const details = node("details", "model-prompts"); details.append(node("summary", "", "查看完整提示词与图片索引"));
+  details.append(node("h3", "", "系统提示词"), node("pre", "model-text", input.system_prompt), node("h3", "", "用户提示词（含时间戳和帧索引）"), node("pre", "model-text", input.prompt));
+  parent.append(details);
+}
+function renderModel(parent) {
+  note(parent, "复用已完成的抽帧结果。选择模型、问题和图片模式后，先预览输入，再单独点击调用模型。切换独立帧或九宫格不重新抽帧；提示词和调用入口与聊天中的指定模型概览一致。");
+  const form = node("form", "model-form"); form.id = "model-form";
+  const row = node("div", "model-form-row"), providerField = node("label", "field", "看图模型"), provider = node("select"); provider.id = "model-provider"; provider.required = true;
+  provider.append(new Option("请选择模型", ""));
+  for (const item of config.providers) provider.append(new Option(item.id + (item.model ? " · " + item.model : "") + (item.vision_confirmed ? "" : "（图片能力未标注）"), item.id));
+  provider.value = modelDraft.provider_id; providerField.append(provider);
+  const modeField = node("label", "field", "本次图片模式"), mode = node("select"); mode.id = "model-mode"; mode.append(new Option("独立帧", "frames"), new Option("九宫格", "grid")); mode.value = modelDraft.mode; modeField.append(mode); row.append(providerField, modeField);
+  const questionField = node("label", "field", "测试问题"), question = node("textarea"); question.id = "model-question"; question.rows = 4; question.maxLength = 4000; question.required = true; question.value = modelDraft.question; questionField.append(question);
+  const onChange = () => {modelDraft = {provider_id: provider.value, mode: mode.value, question: question.value}; updateControls();};
+  provider.addEventListener("change", onChange); mode.addEventListener("change", onChange); question.addEventListener("input", onChange);
+  const controls = node("div", "inline-actions"), preview = node("button", "button", "预览模型输入"); preview.type = "submit";
+  const call = button("调用模型", () => action(startModel), "button primary"); call.id = "model-call";
+  controls.append(preview, call, button("刷新模型列表", () => action(async () => {await loadSessions(); renderKey = ""; render();})));
+  form.append(row, questionField, controls); parent.append(form);
+  form.addEventListener("submit", event => {event.preventDefault(); if (!form.reportValidity()) return; action(async () => {
+    modelPreview = null; pendingModelRun = null;
+    let prepared;
+    try {prepared = await post("model-prepare", {revision: session.revision, ...modelDraft});}
+    catch (error) {try {accept(await bridge.apiGet("debug/session", {id: session.id}));} catch {} throw error;}
+    modelPreview = prepared; pendingModelRun = null;
+    accept(await bridge.apiGet("debug/session", {id: session.id})); renderKey = ""; render();
+  });});
+  if (!config.providers.length) note(parent, "没有可选择的看图模型。请在 AstrBot 配置并启用支持图片输入的模型，再刷新模型列表。", true);
+  note(parent, "只有点击“调用模型”才会提交图片。用量以供应商通过 AstrBot 返回的数据为准，不估算图片专属 token。每次调用单独计时和超时；取消后保留本地帧和调用记录。");
+  if (previewMatches()) {
+    const p = modelPreview.presentation;
+    stats(parent, [["本次输入帧", p.frame_count + " 帧"], ["发送图片", p.image_count + " 张"], ["输入图片体积", bytes(p.total_bytes)], ["输入总像素", number(p.total_pixels / 1000000, 2) + " MP"]]);
+    promptDetails(parent, modelPreview);
+    gallery(parent, "本次实际输入图片", p.images, "model:" + modelPreview.id, "thumb", 6);
+  } else if (session.model.prepared) {
+    parent.append(button("加载已准备的输入预览", () => action(async () => {
+      const detail = await bridge.apiGet("debug/model-record", {id: session.id, record: session.model.prepared.id});
+      modelPreview = detail.input; modelDraft = {provider_id: detail.input.provider.id, question: detail.input.question, mode: detail.input.mode}; renderKey = ""; render();
+    })));
+    note(parent, "更换模型、问题或图片模式后，请重新预览输入。");
+  }
+  renderModelHistory(parent);
+  const actions = node("div", "inline-actions"); actions.append(button("导出全部调试与模型记录 JSON", exportRecord)); parent.append(actions);
+}
+async function startModel() {
+  if (!previewMatches()) throw new Error("请先预览当前模型、问题和图片模式的输入。");
+  if (!pendingModelRun || pendingModelRun.preview_id !== modelPreview.id) pendingModelRun = {preview_id: modelPreview.id, run_id: Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("")};
+  const run = pendingModelRun;
+  const data = await post("model-run", {revision: session.revision, ...run});
+  selectedRuns = [...selectedRuns.filter(id => id !== run.run_id), run.run_id].slice(-2);
+  pendingModelRun = null; accept(data); renderKey = ""; render();
+}
+function renderModelHistory(parent) {
+  const runs = session.model.runs;
+  parent.append(node("h3", "", "调用记录 · " + runs.length + " / " + session.model.max_runs));
+  if (!runs.length) {parent.append(node("p", "muted", "还没有调用模型。完成输入预览后即可开始。")); return;}
+  if (!selectedRuns.length) selectedRuns = runs.slice(-2).map(run => run.id);
+  const list = node("div", "model-run-list");
+  for (const [index, run] of runs.entries()) {
+    const label = node("label", "model-run-choice"), checkbox = node("input"); checkbox.type = "checkbox"; checkbox.checked = selectedRuns.includes(run.id);
+    checkbox.addEventListener("change", () => {selectedRuns = checkbox.checked ? [...selectedRuns.filter(id => id !== run.id), run.id].slice(-2) : selectedRuns.filter(id => id !== run.id); renderKey = ""; render();});
+    label.append(checkbox, node("span", "", "#" + (index + 1) + " · " + run.input.provider.id + " · " + (run.input.mode === "grid" ? "九宫格" : "独立帧") + " · " + modelStatus(run.status))); list.append(label);
+  }
+  parent.append(list);
+  note(parent, "选择最多两条记录并排比较。问题、模型和帧相同时，更适合观察两种图片模式的差别。重跑本地流水线会清空本次调用记录，可先导出保留。");
+  const comparison = node("div", "model-comparison"); parent.append(comparison);
+  const capture = {id: session.id, revision: session.revision};
+  for (const run of runs.filter(item => selectedRuns.includes(item.id))) {
+    const card = node("section", "model-result"); comparison.append(card);
+    card.append(node("h3", "", run.input.provider.id + " · " + (run.input.mode === "grid" ? "九宫格" : "独立帧")), node("p", "small muted", new Date(run.created_at).toLocaleString("zh-CN", {hour12: false}) + " · " + modelStatus(run.status)));
+    stats(card, [["调用耗时", time(run.seconds)], ["发送图片", run.input.image_count + " 张"], ["输入 token", run.usage?.input ?? "未提供"], ["输出 token", run.usage?.output ?? "未提供"], ["缓存输入 token", run.usage?.input_cached ?? "未提供"], ["总 token", run.usage?.total ?? "未提供"]]);
+    card.append(node("p", "model-question", run.input.question));
+    if (run.error) note(card, run.error, true);
+    if (["queued", "running"].includes(run.status)) {card.append(node("p", "muted", "等待模型返回…")); continue;}
+    const body = node("div"); card.append(body); body.append(node("p", "muted", "加载记录…"));
+    if (!modelDetails.has(run.id)) modelDetails.set(run.id, bridge.apiGet("debug/model-record", {id: capture.id, record: run.id}));
+    modelDetails.get(run.id).then(detail => {
+      if (!body.isConnected || session?.id !== capture.id || session?.revision !== capture.revision) return;
+      body.replaceChildren(node("pre", "model-text model-answer", detail.answer || "本次没有返回有效回答。"));
+      promptDetails(body, detail.input);
+      const pictures = button("查看本次输入图片", () => {pictures.disabled = true; gallery(body, "记录中的输入图片", detail.input.presentation.images, "model:" + run.id, "thumb", 6);}); body.append(pictures);
+    }).catch(error => {modelDetails.delete(run.id); if (body.isConnected) body.replaceChildren(node("p", "", error.message || "记录加载失败"));});
+  }
+}
+function modelStatus(status) {return {queued: "等待调用", running: "调用中", succeeded: "成功", failed: "失败", cancelled: "已取消"}[status] || status;}
 function table(parent, title, headers, rows) {
   const section = node("section"); parent.append(section);
   const key = session.id + "/" + session.revision + "/table/" + title;
@@ -316,6 +414,7 @@ function gallery(parent, title, items, kind, variant = "thumb", size = 24) {
   }; draw();
 }
 function frameCard(item, kind, index, variant = "thumb") {
+  if (kind.startsWith("model:")) return gridCard(item, index, kind);
   if (kind === "grid") return gridCard(item, index);
   const card = button("", () => showFrame(kind, index, variant), "frame-card " + (item.reason === "scene_change" ? "scene" : item.reason));
   const imageBox = node("div", "frame-image"), placeholder = node("span", "placeholder", "按需加载预览"), image = node("img");
@@ -331,15 +430,16 @@ function frameCard(item, kind, index, variant = "thumb") {
   observer.observe(imageBox);
   return card;
 }
-function gridCard(item, index) {
-  const card = button("", () => showGrid(index), "frame-card");
+function gridCard(item, index, kind = "grid") {
+  const label = kind === "grid" ? "拼图" : "输入图片";
+  const card = button("", () => showGrid(index, kind), "frame-card");
   const imageBox = node("div", "frame-image"), placeholder = node("span", "placeholder", "按需加载拼图"), image = node("img");
-  image.alt = "第 " + (index + 1) + " 张九宫格"; imageBox.append(placeholder, image);
+  image.alt = label + " " + (index + 1); imageBox.append(placeholder, image);
   const meta = node("div", "frame-meta"), first = item.cells[0], last = item.cells[item.cells.length - 1];
-  meta.append(node("strong", "", "拼图 " + (index + 1) + " · " + item.cells.length + " 帧"), node("p", "", item.width + "×" + item.height + " · PNG"), node("p", "", time(first.timestamp_sec) + " – " + time(last.timestamp_sec)));
+  meta.append(node("strong", "", label + " " + (index + 1) + " · " + item.cells.length + " 帧"), node("p", "", item.width + "×" + item.height + " · " + (item.mime_type === "image/png" ? "PNG" : "JPEG")), node("p", "", time(first.timestamp_sec) + " – " + time(last.timestamp_sec)));
   card.append(imageBox, meta);
   const capture = {id: session.id, revision: session.revision};
-  imageBox._load = () => getImage(capture, "grid", index, "thumb").then(data => {image.src = data.data_url; placeholder.remove();}).catch(() => {placeholder.textContent = "预览失败，点击重试";});
+  imageBox._load = () => getImage(capture, kind, index, "thumb").then(data => {image.src = data.data_url; placeholder.remove();}).catch(() => {placeholder.textContent = "预览失败，点击重试";});
   observer.observe(imageBox);
   return card;
 }
@@ -360,7 +460,8 @@ function pumpImages() {
     const job = imageQueue.shift();
     if (job.capture.id !== session?.id || job.capture.revision !== session?.revision) {job.reject(new Error("测试已切换")); continue;}
     activeImages++;
-    bridge.apiGet("debug/image", {id: job.capture.id, revision: job.capture.revision, kind: job.kind, index: job.index, variant: job.variant}).then(job.resolve, job.reject).finally(() => {activeImages--; pumpImages(); refreshPreviewTiming();});
+    const [kind, record] = job.kind.split(":");
+    bridge.apiGet("debug/image", {id: job.capture.id, revision: job.capture.revision, kind, ...(record ? {record} : {}), index: job.index, variant: job.variant}).then(job.resolve, job.reject).finally(() => {activeImages--; pumpImages(); refreshPreviewTiming();});
   }
 }
 function refreshPreviewTiming() {
@@ -377,21 +478,21 @@ function refreshPreviewTiming() {
 }
 function seek(timestamp) { if (videoURL && selectedVideoSession === session?.id) $("source-video").currentTime = timestamp; }
 function closeDialog() { dialogVersion++; if ($("image-dialog").open) $("image-dialog").close(); }
-async function showGrid(index) {
+async function showGrid(index, kind = "grid") {
   const version = ++dialogVersion, capture = {id: session.id, revision: session.revision};
-  $("image-title").textContent = "九宫格输出 · 第 " + (index + 1) + " 张";
-  $("image-description").textContent = "这是实际发送给模型的 PNG，拼接时保留各帧分辨率。";
+  $("image-title").textContent = (kind === "grid" ? "九宫格输出" : "模型输入图片") + " · 第 " + (index + 1) + " 张";
+  $("image-description").textContent = "完整图片文件，缩略预览不参与模型调用。";
   const content = $("image-content"); content.replaceChildren(node("p", "muted", "正在加载完整拼图…"));
   if (!$("image-dialog").open) $("image-dialog").showModal();
   try {
-    const data = await getImage(capture, "grid", index, "full");
+    const data = await getImage(capture, kind, index, "full");
     if (version !== dialogVersion) return;
     content.replaceChildren();
     const viewport = node("div", "grid-viewport"), image = node("img"); image.src = data.data_url; image.alt = "带帧编号与实际时间戳的完整九宫格"; viewport.append(image);
     const toggle = button("按原始像素查看", () => {const actual = viewport.classList.toggle("actual-size"); toggle.textContent = actual ? "适应窗口" : "按原始像素查看";});
     const actions = node("div", "inline-actions"); actions.append(toggle); content.append(actions, viewport);
-    note(content, data.image.width + " × " + data.image.height + " · " + bytes(data.image.bytes) + " · PNG。切换为原始像素后，可滚动查看细节。");
-    table(content, "帧与格子对应关系", ["帧编号", "行 / 列", "实际时间", "单帧尺寸", "frame_id"], data.image.cells.map(cell => ["#" + cell.frame_number, cell.row + " / " + cell.column, time(cell.timestamp_sec), cell.width + "×" + cell.height, cell.frame_id]));
+    note(content, data.image.width + " × " + data.image.height + " · " + bytes(data.image.bytes) + "。切换为原始像素后，可滚动查看细节。");
+    table(content, "帧与格子对应关系", ["帧编号", "行 / 列", "实际时间", "单帧尺寸", "frame_id"], data.image.cells.map(cell => ["#" + cell.frame_number, (cell.row || 1) + " / " + (cell.column || 1), time(cell.timestamp_sec), (cell.width || data.image.width) + "×" + (cell.height || data.image.height), cell.frame_id]));
   } catch (error) {if (version === dialogVersion) content.replaceChildren(node("p", "", error.message || "拼图加载失败"));}
 }
 async function showFrame(kind, index, variant) {
@@ -433,8 +534,11 @@ async function showFrame(kind, index, variant) {
   } catch (error) { if (version === dialogVersion) content.replaceChildren(node("p", "", error.message || "图片加载失败")); }
 }
 function exportRecord() {
-  const blob = new Blob([JSON.stringify(session, null, 2)], {type: "application/json"}), url = URL.createObjectURL(blob), link = node("a");
-  link.href = url; link.download = "vision-pipeline-" + session.id.slice(0, 8) + ".json"; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return action(async () => {
+    const capture = session, records = await bridge.apiGet("debug/model-records", {id: capture.id});
+    const blob = new Blob([JSON.stringify({...capture, model_records: records}, null, 2)], {type: "application/json"}), url = URL.createObjectURL(blob), link = node("a");
+    link.href = url; link.download = "vision-pipeline-" + capture.id.slice(0, 8) + ".json"; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
 }
 async function upload(file) {
   if (!file || session?.running) return;
@@ -454,7 +558,7 @@ function bindEvents() {
   $("drop-zone").addEventListener("dragover", event => {event.preventDefault(); $("drop-zone").classList.add("dragging");});
   $("drop-zone").addEventListener("dragleave", () => $("drop-zone").classList.remove("dragging"));
   $("drop-zone").addEventListener("drop", event => {event.preventDefault(); $("drop-zone").classList.remove("dragging"); upload(event.dataTransfer.files[0]);});
-  $("next").addEventListener("click", () => action(async () => {accept(await post("next", {completed: session.completed, revision: session.revision}));}));
+  $("next").addEventListener("click", () => {if (session?.done) {view = 7; render(); return;} action(async () => {accept(await post("next", {completed: session.completed, revision: session.revision}));});});
   $("cancel").addEventListener("click", () => action(async () => accept(await post("cancel"))));
   $("parameters").addEventListener("submit", event => {event.preventDefault(); if (!$("parameters").reportValidity()) return; action(async () => {accept(await post("reset", {parameters: params()}), true); message("已应用本次参数。点击执行视频探测开始重跑。");});});
   $("delete").addEventListener("click", () => action(async () => {
