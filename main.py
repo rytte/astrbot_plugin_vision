@@ -15,6 +15,7 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_temp_path
 from mcp.types import CallToolResult, TextContent
 
+from .agent_images import ToolImageBuffer, defer_tool_images
 from .config import Settings
 from .media import FFmpegMedia, VideoError
 from .sampling import InspectArgumentError
@@ -82,6 +83,8 @@ class VisionPlugin(Star):
     async def release_agent_context(
         self, event: AstrMessageEvent, run_context: ContextWrapper, llm_response
     ) -> None:
+        if isinstance(run_context.messages, ToolImageBuffer):
+            run_context.messages.discard()
         if event.get_extra("vision_agent_context") is run_context:
             event.set_extra("vision_agent_context", None)
 
@@ -91,6 +94,7 @@ class VisionPlugin(Star):
             state = {
                 "prepared": False,
                 "captured": False,
+                "attachment_paths": set(),
                 "attachment_errors": [],
                 "question": "",
                 "inspect_calls": 0,
@@ -153,6 +157,7 @@ class VisionPlugin(Star):
                     stat.st_mtime_ns,
                     time.monotonic() + self.settings.cache_ttl,
                 )
+                state["attachment_paths"].add(str(path))
             except Exception as exc:
                 logger.warning("准备视频附件失败：%s", exc)
                 errors.append(
@@ -171,7 +176,7 @@ class VisionPlugin(Star):
         state["question"] = request.prompt or ""
         videos = self.resources.get(self._owner(event), {})
         errors = state["attachment_errors"]
-        available = list(videos)[-8:]
+        available = [path for path in videos if path in state["attachment_paths"]][-8:]
         if available or errors:
             request.prompt = (
                 (request.prompt or "")
@@ -289,9 +294,11 @@ class VisionPlugin(Star):
                     )
                 if image_parts:
                     # ImageContent 会触发核心添加“满意后发给用户”的通用提示。
-                    # 直接加入当前 Agent 上下文，保留真实图片和逐帧时间戳。
-                    image_context.messages.append(
-                        Message(role="user", content=image_parts)
+                    # 等核心写入工具调用及结果后，再追加真实图片和逐帧时间戳。
+                    defer_tool_images(
+                        image_context,
+                        f"video_{action}",
+                        Message(role="user", content=image_parts),
                     )
                 state["seen"].update(frame.frame_id for frame in frames)
                 if action == "overview":

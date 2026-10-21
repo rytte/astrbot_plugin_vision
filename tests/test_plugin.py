@@ -12,15 +12,24 @@ from astrbot.api import AstrBotConfig
 from astrbot.api.message_components import Reply, Video
 from astrbot.api.star import Context
 from astrbot.core.agent.hooks import BaseAgentRunHooks
-from astrbot.core.agent.message import ImageURLPart, Message
+from astrbot.core.agent.message import (
+    AssistantMessageSegment,
+    ImageURLPart,
+    Message,
+    ToolCallMessageSegment,
+)
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
 from astrbot.core.agent.tool import FunctionTool, ToolSet
 from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
-from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+    InternalAgentSubStage,
+)
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest, ToolCallsResult
 from astrbot.core.star.register.star_handler import llm_tools
 from astrbot.core.star.star import StarMetadata
 from astrbot.core.star.star_manager import PluginManager
+from astrbot_plugin_vision.agent_images import ToolImageBuffer
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
@@ -56,6 +65,18 @@ class Event:
 
     def set_extra(self, name, value):
         self.extras[name] = value
+
+
+class PluginAgentHooks(BaseAgentRunHooks):
+    def __init__(self, plugin, event):
+        self.plugin = plugin
+        self.event = event
+
+    async def on_agent_begin(self, run_context):
+        await self.plugin.bind_agent_context(self.event, run_context)
+
+    async def on_agent_done(self, run_context, llm_response):
+        await self.plugin.release_agent_context(self.event, run_context, llm_response)
 
 
 @pytest.fixture
@@ -99,6 +120,28 @@ def image_parts(event):
         for part in message.content
         if isinstance(part, ImageURLPart)
     ]
+
+
+def record_tool_result(event, tool_name, result):
+    """工具单测模拟核心批量写入消息；完整调用链另由真实 runner 测试覆盖。"""
+    response = LLMResponse(
+        role="assistant",
+        tools_call_name=[tool_name],
+        tools_call_args=[{}],
+        tools_call_ids=["call_video"],
+    )
+    event.agent_context.messages.extend(
+        ToolCallsResult(
+            tool_calls_info=AssistantMessageSegment(
+                tool_calls=response.to_openai_tool_calls_model()
+            ),
+            tool_calls_result=[
+                ToolCallMessageSegment(
+                    tool_call_id="call_video", content=result.content[0].text
+                )
+            ],
+        ).to_openai_messages_model()
+    )
 
 
 def test_configuration_schema_matches_defaults(tmp_path):
@@ -313,13 +356,6 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         text_chat=AsyncMock(side_effect=responses),
     )
 
-    class Hooks(BaseAgentRunHooks):
-        async def on_agent_begin(self, run_context):
-            await plugin.bind_agent_context(event, run_context)
-
-        async def on_agent_done(self, run_context, llm_response):
-            await plugin.release_agent_context(event, run_context, llm_response)
-
     context = ContextWrapper(context=SimpleNamespace(event=event))
     runner = ToolLoopAgentRunner()
     await runner.reset(
@@ -327,7 +363,7 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         request=ProviderRequest(prompt="视频里发生了什么？", func_tool=ToolSet([tool])),
         run_context=context,
         tool_executor=FunctionToolExecutor(),
-        agent_hooks=Hooks(),
+        agent_hooks=PluginAgentHooks(plugin, event),
     )
     async for _ in runner.step_until_done(len(responses)):
         pass
@@ -354,6 +390,13 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         and isinstance(message.content, list)
         and any(part.type == "image_url" for part in message.content)
     )
+    image_index = messages.index(image_message)
+    assert messages[image_index - 1].role == "tool"
+    assert messages[image_index - 1].tool_call_id == "call_video"
+    assert messages[0].role == "user"
+    assert all(part.type == "text" for part in messages[0].content)
+    assert "".join(part.text for part in messages[0].content) == "视频里发生了什么？"
+    assert type(context.messages) is list
     parts = image_message.content
     images = [part for part in parts if part.type == "image_url"]
     assert len(images) == metadata["new_frame_count"] > 0
@@ -370,6 +413,185 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     assert "send_message_to_user" not in serialized
     assert event.get_extra("vision_agent_context") is None
 
+    conversation_manager = SimpleNamespace(update_conversation=AsyncMock())
+    await InternalAgentSubStage._save_to_history(
+        SimpleNamespace(conv_manager=conversation_manager),
+        event,
+        ProviderRequest(
+            conversation=SimpleNamespace(cid="test-conversation"),
+            tool_calls_result=runner.req.tool_calls_result,
+        ),
+        runner.get_final_llm_resp(),
+        context.messages,
+        None,
+    )
+    history = conversation_manager.update_conversation.await_args.kwargs["history"]
+    assert [message["role"] for message in history] == [
+        *[message.role for message in messages],
+        "assistant",
+    ]
+    assert history[image_index - 1]["tool_call_id"] == "call_video"
+    assert history[image_index]["content"] == image_message.model_dump()["content"]
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+async def test_real_agent_loop_orders_images_across_batches_and_context_rebuilds(
+    plugin, sample_video, batch_size
+):
+    plugin.settings = replace(plugin.settings, inspect_max_calls=4)
+    event = Event(admin=True, agent=False)
+    responses = [
+        LLMResponse(
+            role="assistant",
+            tools_call_name=["video_inspect"] * batch_size,
+            tools_call_args=[
+                {
+                    "video_path": str(sample_video),
+                    "mode": "timestamps",
+                    "times_sec": [(round_index * batch_size + index) * 0.8],
+                    "max_frames": None,
+                    "max_edge": 128,
+                }
+                for index in range(batch_size)
+            ],
+            tools_call_ids=[
+                f"call_{round_index}_{index}" for index in range(batch_size)
+            ],
+        )
+        for round_index in range(2)
+    ]
+    responses.append(LLMResponse(role="assistant", completion_text="已核实"))
+    provider = SimpleNamespace(
+        provider_config={"id": "test", "modalities": ["image", "tool_use"]},
+        text_chat=AsyncMock(side_effect=responses),
+    )
+    context = ContextWrapper(context=SimpleNamespace(event=event))
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=ProviderRequest(
+            prompt="请分两轮核实视频",
+            func_tool=ToolSet([llm_tools.get_func("video_inspect")]),
+        ),
+        run_context=context,
+        tool_executor=FunctionToolExecutor(),
+        agent_hooks=PluginAgentHooks(plugin, event),
+    )
+    # 上下文处理可以重建列表；缓冲必须在每批抽帧时重新绑定到当前列表。
+    runner.request_context_manager.process = AsyncMock(
+        side_effect=lambda messages, **kwargs: list(messages)
+    )
+    async for _ in runner.step_until_done(3):
+        pass
+    assert provider.text_chat.await_count == 3
+    messages = context.messages
+    expected_roles = ["user"]
+    offset = 1
+    for round_index in range(2):
+        expected_roles.extend(
+            ["assistant", *["tool"] * batch_size, *["user"] * batch_size]
+        )
+        results = messages[offset + 1 : offset + 1 + batch_size]
+        pictures = messages[offset + 1 + batch_size : offset + 1 + 2 * batch_size]
+        assert [message.tool_call_id for message in results] == [
+            f"call_{round_index}_{index}" for index in range(batch_size)
+        ]
+        for result, picture in zip(results, pictures):
+            metadata = json.loads(result.content)
+            assert metadata["success"]
+            assert [
+                json.loads(part.text) for part in picture.content if part.type == "text"
+            ] == metadata["frames"]
+            assert sum(part.type == "image_url" for part in picture.content) == 1
+        offset += 1 + 2 * batch_size
+    assert [message.role for message in messages] == [*expected_roles, "assistant"]
+    provider_messages = provider.text_chat.await_args.kwargs["contexts"]
+    assert [
+        Message.model_validate(message).role for message in provider_messages
+    ] == expected_roles
+    assert type(context.messages) is list
+
+
+async def test_aborted_tool_batch_discards_unrecorded_images(plugin, sample_video):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_tool(event):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    event = Event(admin=True, agent=False)
+    provider = SimpleNamespace(
+        provider_config={"id": "test", "modalities": ["image", "tool_use"]},
+        text_chat=AsyncMock(
+            return_value=LLMResponse(
+                role="assistant",
+                tools_call_name=["video_inspect", "slow_tool"],
+                tools_call_args=[
+                    {
+                        "video_path": str(sample_video),
+                        "mode": "timestamps",
+                        "times_sec": [0],
+                        "max_frames": None,
+                        "max_edge": None,
+                    },
+                    {},
+                ],
+                tools_call_ids=["call_video", "call_slow"],
+            )
+        ),
+    )
+    context = ContextWrapper(context=SimpleNamespace(event=event))
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=ProviderRequest(
+            prompt="看看视频",
+            func_tool=ToolSet(
+                [
+                    llm_tools.get_func("video_inspect"),
+                    FunctionTool(
+                        name="slow_tool",
+                        description="等待测试中断",
+                        parameters={"type": "object", "properties": {}},
+                        handler=slow_tool,
+                    ),
+                ]
+            ),
+        ),
+        run_context=context,
+        tool_executor=FunctionToolExecutor(),
+        agent_hooks=PluginAgentHooks(plugin, event),
+    )
+
+    async def drive():
+        async for _ in runner.step_until_done(3):
+            pass
+
+    task = asyncio.create_task(drive())
+    try:
+        await asyncio.wait_for(started.wait(), 10)
+        assert isinstance(context.messages, ToolImageBuffer)
+        assert len(context.messages) == 1
+        runner.request_stop()
+        await asyncio.wait_for(task, 10)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert runner.was_aborted()
+    assert cancelled.is_set()
+    assert type(context.messages) is list
+    assert event.get_extra("vision_agent_context") is None
+    assert not any(
+        part.type == "image_url"
+        for message in context.messages
+        if isinstance(message.content, list)
+        for part in message.content
+    )
+
 
 async def test_video_attachment_is_exposed_and_authorized(plugin, sample_video):
     event = Event(messages=[Video(file=str(sample_video))])
@@ -381,6 +603,49 @@ async def test_video_attachment_is_exposed_and_authorized(plugin, sample_video):
     await plugin.prepare_video_resources(event, request)
     assert request.prompt == first
     assert plugin._state(event)["question"] == "视频里发生了什么？"
+
+
+async def test_cached_video_is_not_repeated_in_later_prompts(plugin, sample_video):
+    attachment = Event(messages=[Video(file=str(sample_video))])
+    await plugin.prepare_video_resources(attachment, SimpleNamespace(prompt="看看视频"))
+
+    for prompt in (
+        "两分钟后发下今日小猪",
+        "抽到了什么",
+        "我收到了，我只是想看看你看不看得到",
+        "也有可能是定时任务的原因",
+        "你再发一次",
+        "好嘟",
+        "那段视频的开头说了什么",
+    ):
+        event = Event()
+        request = SimpleNamespace(prompt=prompt)
+        await plugin.prepare_video_resources(event, request)
+        assert request.prompt == prompt
+        assert not plugin._state(event)["attachment_paths"]
+        assert plugin._authorize(event, str(sample_video)) == sample_video
+
+    result = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[0]
+    )
+    assert not result.isError
+
+
+async def test_new_video_prompt_does_not_include_cached_old_video(plugin, sample_video):
+    old_event = Event(messages=[Video(file=str(sample_video))])
+    await plugin.prepare_video_resources(old_event, SimpleNamespace(prompt="旧视频"))
+    new_video = sample_video.with_name("new video.mp4")
+    await asyncio.to_thread(
+        new_video.write_bytes, await asyncio.to_thread(sample_video.read_bytes)
+    )
+
+    event = Event(messages=[Video(file=str(new_video))])
+    request = SimpleNamespace(prompt="新视频")
+    await plugin.prepare_video_resources(event, request)
+    resources = json.loads(request.prompt.split("\n")[3])
+    assert resources["video_paths"] == [str(new_video)]
+    assert plugin._authorize(event, str(sample_video)) == sample_video
+    assert plugin._authorize(event, str(new_video)) == new_video
 
 
 async def test_quoted_video_attachment_is_supported(plugin, sample_video):
@@ -416,6 +681,8 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     result = await plugin.video_overview(event, str(sample_video))
     assert not result.isError
     assert all(content.type == "text" for content in result.content)
+    assert not image_parts(event)
+    record_tool_result(event, "video_overview", result)
     images = image_parts(event)
     assert len(images) == data(result)["new_frame_count"] > 0
     for image in images:
@@ -441,6 +708,7 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     assert not inspect.isError
     assert data(inspect)["remaining_inspect_calls"] == 2
     assert all(content.type == "text" for content in inspect.content)
+    record_tool_result(event, "video_inspect", inspect)
     assert len(image_parts(event)) == len(images) + data(inspect)["new_frame_count"]
 
 
@@ -479,6 +747,7 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     )
     assert not inspected.isError
     assert all(content.type == "text" for content in inspected.content)
+    record_tool_result(event, "video_inspect", inspected)
     assert len(image_parts(event)) == data(inspected)["new_frame_count"] > 0
     assert data(inspected)["frames"][0]["frame_id"] == overview["frames"][0]["frame_id"]
     plugin.context.llm_generate.assert_awaited_once()
@@ -692,7 +961,13 @@ async def test_parallel_overview_does_not_send_duplicate_images(plugin, sample_v
         result for result in results if result.content[0].text.startswith("{")
     ]
     assert len(with_images) == 1
-    assert len(event.agent_context.messages) == 1
+    assert not event.agent_context.messages
+    record_tool_result(event, "video_overview", with_images[0])
+    assert [message.role for message in event.agent_context.messages] == [
+        "assistant",
+        "tool",
+        "user",
+    ]
     assert len(image_parts(event)) == data(with_images[0])["new_frame_count"]
 
 
