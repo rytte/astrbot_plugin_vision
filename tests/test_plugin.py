@@ -28,7 +28,9 @@ from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest, ToolCallsResult
 from astrbot.core.star.register.star_handler import llm_tools
 from astrbot.core.star.star import StarMetadata
+from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.star_manager import PluginManager
+from astrbot.dashboard.services.plugin_service import PluginService
 from astrbot_plugin_vision.agent_images import ToolImageBuffer
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.main import VisionPlugin
@@ -155,6 +157,23 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert Settings.from_mapping(config) == Settings()
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""
+
+
+async def test_plugin_details_list_both_model_tools_without_instantiation():
+    # 插件未实例化（例如启动时已禁用）时，详情页仍应列出完整工具。
+    handlers = star_handlers_registry.get_handlers_by_module_name(
+        VisionPlugin.__module__
+    )
+    service = PluginService(core_lifecycle=None, plugin_manager=None)
+    components = await service.get_plugin_handler_components(
+        [handler.handler_full_name for handler in handlers]
+    )
+    tools = [component for component in components if component["type"] == "llm_tool"]
+    assert len(tools) == 2
+    assert {tool["name"] for tool in tools} == {"video_overview", "video_inspect"}
+    assert all(
+        tool["description"] and tool["description"] != "无描述" for tool in tools
+    )
 
 
 def test_registered_tools_have_provider_compatible_schema(plugin):

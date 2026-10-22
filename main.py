@@ -12,6 +12,8 @@ from astrbot.api.message_components import File, Reply, Video
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.star.register.star_handler import get_handler_or_create
+from astrbot.core.star.star_handler import EventType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_temp_path
 from mcp.types import CallToolResult, TextContent
 
@@ -469,7 +471,7 @@ class VisionPlugin(Star):
         max_frames: int | None = None,
         max_edge: int | None = None,
     ) -> CallToolResult:
-        """由显式 FunctionTool Schema 注册，mode 与 times_sec 必填且不推断默认模式。"""
+        """按时间范围或指定时间点回看视频原图，核验动作、画面和文字细节。"""
         return await self._tool(
             event,
             "inspect",
@@ -488,3 +490,7 @@ class VisionPlugin(Star):
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.media.close()
         self.resources.clear()
+
+
+# 原生 FunctionTool 不自动登记处理器；导入时补齐元数据，供 WebUI 展示并随插件卸载。
+get_handler_or_create(VisionPlugin.video_inspect, EventType.OnCallingFuncToolEvent)
