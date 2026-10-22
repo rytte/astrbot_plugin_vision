@@ -41,7 +41,7 @@ class OutputImage:
 
 
 def presentation_metadata(mode: str, images: list[OutputImage]) -> dict:
-    return {
+    data = {
         "mode": mode,
         "reading_order": "left_to_right_then_top_to_bottom",
         "note": "九宫格保留抽帧后的像素尺寸，编号和实际时间戳位于画面外；按 cells 引用证据。"
@@ -55,6 +55,14 @@ def presentation_metadata(mode: str, images: list[OutputImage]) -> dict:
         ),
         "images": [image.metadata() for image in images],
     }
+    if mode == "frames" and images:
+        sizes = {(image.width, image.height) for image in images}
+        if len(sizes) == 1:
+            data["frame_width"], data["frame_height"] = next(iter(sizes))
+            data["note"] += "帧尺寸共用 frame_width/frame_height。"
+            for image in data["images"]:
+                del image["width"], image["height"]
+    return data
 
 
 def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:

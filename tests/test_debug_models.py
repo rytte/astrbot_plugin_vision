@@ -365,6 +365,15 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
                 == (session.pipeline.kept[0].width, session.pipeline.kept[0].height)
                 for image in payload["presentation"]["images"]
             )
+        else:
+            assert (
+                payload["presentation"]["frame_width"],
+                payload["presentation"]["frame_height"],
+            ) == (session.pipeline.kept[0].width, session.pipeline.kept[0].height)
+            assert all(
+                "width" not in image and "height" not in image
+                for image in payload["presentation"]["images"]
+            )
         image = await sessions.image(session, "model", 0, "full", 0, prepared["id"])
         assert image["image"]["cells"] == payload["presentation"]["images"][0]["cells"]
         assert (

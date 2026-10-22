@@ -118,12 +118,29 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count, u
     assert presentation_metadata("grid", images)["frame_count"] == count
 
 
-async def test_independent_mode_returns_original_jpegs(media):
-    frames = make_frames(media, 3)
+@pytest.mark.parametrize("uniform", [False, True])
+async def test_independent_mode_returns_original_jpegs(media, uniform):
+    frames = make_frames(media, 3, uniform=uniform)
     images = await present_frames(media, frames, mode="frames")
     assert [image.path for image in images] == [frame.path for frame in frames]
     assert all(image.mime_type == "image/jpeg" for image in images)
     assert all("requested_sec" not in image.cells[0] for image in images)
+    metadata = presentation_metadata("frames", images)
+    if uniform:
+        assert (metadata["frame_width"], metadata["frame_height"]) == (64, 48)
+        assert all(
+            "width" not in image and "height" not in image
+            for image in metadata["images"]
+        )
+    else:
+        assert "frame_width" not in metadata and "frame_height" not in metadata
+        assert [(image["width"], image["height"]) for image in metadata["images"]] == [
+            (frame.width, frame.height) for frame in frames
+        ]
+    # 公共文本元数据的压缩不改变原图及内部图片尺寸。
+    assert [
+        (image.metadata()["width"], image.metadata()["height"]) for image in images
+    ] == [(frame.width, frame.height) for frame in frames]
 
 
 async def test_grid_cache_reuses_same_labels_but_changes_with_frame_order(

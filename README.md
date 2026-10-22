@@ -65,7 +65,7 @@ ffprobe -version
 {"video_path": "/AstrBot/data/temp/example.mp4"}
 ```
 
-返回视频元信息、采样策略、预算是否导致降采样、实际最大采样间隔，以及按时间排序的图片。每张图片附带 `frame_id`、实际时间 `timestamp_sec` 和入选原因；逐帧描述不重复附带宽高。模型输入和工具结果均不输出 `requested_sec`，内部抽帧记录与调试台的“请求 → 实际”对照仍保留请求时间，用于检查定位偏差。
+返回视频元信息、采样策略、预算是否导致降采样、实际最大采样间隔，以及按时间排序的图片。每张图片附带 `frame_id`、实际时间 `timestamp_sec` 和入选原因。独立帧尺寸一致时，宽高只在 `presentation.frame_width/frame_height` 写一次，`presentation.images[]` 不再逐张重复；尺寸不一致时才逐张记录。概览看图模型的输入、转述工具结果和调试台共用该格式。模型输入和工具结果均不输出 `requested_sec`，内部抽帧记录与调试台的“请求 → 实际”对照仍保留请求时间，用于检查定位偏差。
 
 直接看图和局部回看时，帧明细只在 `user` 图片消息中提供一次，每张图片紧邻对应说明；每组消息开头用 `tool`、`video_path` 标识来源，便于区分同批调用的多个视频。`tool` 结果不再包含 `frames`、`presentation.images` 或 `skipped_already_seen` 明细，已看过而跳过的帧仅通过 `skipped_already_seen_count` 返回数量。指定概览看图模型时，主模型不接收概览图片，因此工具结果仍保留文字概览和帧索引。
 

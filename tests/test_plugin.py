@@ -40,6 +40,7 @@ from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
 from astrbot_plugin_vision.tools import VideoInspectTool
 from jsonschema import ValidationError, validate
+from PIL import Image
 
 
 class Event:
@@ -1081,6 +1082,14 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert '"requested_sec"' not in call["prompt"]
     assert prompt_data["user_question"] == question
     assert prompt_data["frames"] == overview["frames"]
+    presentation = overview["presentation"]
+    assert prompt_data["presentation"] == presentation
+    with Image.open(call["image_urls"][0]) as image:
+        assert (presentation["frame_width"], presentation["frame_height"]) == image.size
+    assert all(
+        "width" not in image and "height" not in image
+        for image in presentation["images"]
+    )
     assert not plugin._state(event)["seen"]
     assert plugin._state(event)["overviews"]
     assert not image_parts(event)

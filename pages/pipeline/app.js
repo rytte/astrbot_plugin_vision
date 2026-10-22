@@ -406,7 +406,7 @@ function renderModel(parent) {
     const p = modelPreview.presentation;
     stats(parent, [["本次输入帧", p.frame_count + " 帧"], ["发送图片", p.image_count + " 张"], ["输入图片体积", bytes(p.total_bytes)], ["输入总像素", number(p.total_pixels / 1000000, 2) + " MP"]]);
     promptDetails(parent, modelPreview);
-    gallery(parent, "本次实际输入图片", p.images, "model:" + modelPreview.id, "thumb", 6);
+    gallery(parent, "本次实际输入图片", presentationImages(p), "model:" + modelPreview.id, "thumb", 6);
   } else if (session.model.prepared) {
     parent.append(button("加载已准备的输入预览", () => action(async () => {
       const detail = await bridge.apiGet("debug/model-record", {id: session.id, record: session.model.prepared.id});
@@ -478,7 +478,7 @@ function renderModelHistory(parent) {
       if (!body.isConnected || session?.id !== capture.id || session?.revision !== capture.revision) return;
       body.replaceChildren(node("pre", "model-text model-answer", detail.answer || "本次没有返回有效回答。"));
       promptDetails(body, detail.input);
-      const pictures = button("查看本次输入图片", () => {pictures.disabled = true; gallery(body, "记录中的输入图片", detail.input.presentation.images, "model:" + run.id, "thumb", 6);}); body.append(pictures);
+      const pictures = button("查看本次输入图片", () => {pictures.disabled = true; gallery(body, "记录中的输入图片", presentationImages(detail.input.presentation), "model:" + run.id, "thumb", 6);}); body.append(pictures);
     }).catch(error => {modelDetails.delete(run.id); if (body.isConnected) body.replaceChildren(node("p", "", error.message || "记录加载失败"));});
   }
 }
@@ -504,6 +504,9 @@ function pager(page, total, size, change) {
   controls.append(node("span", "", total + " 项 · " + (page + 1) + "/" + count));
   if (count > 1) { const prev = button("‹", () => change(-1)), next = button("›", () => change(1)); prev.disabled = page <= 0; next.disabled = page >= count - 1; controls.append(prev, next); }
   return controls;
+}
+function presentationImages(presentation) {
+  return presentation.images.map(image => ({...image, width: image.width ?? presentation.frame_width, height: image.height ?? presentation.frame_height}));
 }
 function gallery(parent, title, items, kind, variant = "thumb", size = 24) {
   const section = node("section"), key = session.id + "/" + session.revision + "/gallery/" + title;
