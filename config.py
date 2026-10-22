@@ -9,6 +9,12 @@ from dataclasses import dataclass, fields
 class Settings:
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
+    share_links_enabled: bool = True
+    download_max_mb: int = 200
+    download_max_duration: float = 1800.0
+    download_cache_max_mb: int = 1024
+    download_cookie_file: str = ""
+    download_allow_fake_ip: bool = False
     overview_model_enabled: bool = False
     overview_provider_id: str = ""
     asr_enabled: bool = False

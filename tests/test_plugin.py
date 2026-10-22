@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -8,8 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from aiocqhttp import Event as OneBotEvent
 from astrbot.api import AstrBotConfig
-from astrbot.api.message_components import Reply, Video
+from astrbot.api.message_components import Json, Plain, Reply, Video
 from astrbot.api.star import Context
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.message import (
@@ -181,6 +183,12 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert schema["asr_enabled"]["default"] is False
     assert schema["asr_provider_id"]["_special"] == "select_provider_stt"
     assert schema["asr_provider_id"]["condition"] == {"asr_enabled": True}
+    assert schema["share_links_enabled"]["default"] is True
+    assert schema["download_cookie_file"]["condition"] == {"share_links_enabled": True}
+    assert schema["download_allow_fake_ip"]["default"] is False
+    assert schema["download_allow_fake_ip"]["condition"] == {
+        "share_links_enabled": True
+    }
 
 
 async def test_removed_extra_directories_are_ignored_and_default_roots_still_apply(
@@ -1170,7 +1178,7 @@ async def test_delegated_model_shares_tool_timeout(
     assert result.isError
     assert data(result)["error"]["code"] == "TIMEOUT"
     assert wait_for.await_count == 2
-    assert wait_for.await_args_list[0].args[1] == 0.2
+    assert 0.18 < wait_for.await_args_list[0].args[1] <= 0.2
     assert 0 < wait_for.await_args_list[1].args[1] < 0.18
     assert cancelled.is_set()
     assert not plugin._state(event)["overviews"]
@@ -1424,3 +1432,201 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     assert "从左到右" in call["prompt"]
     assert not image_parts(event)
     assert not plugin._state(event)["seen"]
+
+
+async def prepare_share(plugin, event):
+    request = ProviderRequest(prompt="分析这个视频")
+    await plugin.prepare_video_resources(event, request)
+    return json.loads(request.extra_user_content_parts[-1].text.split("\n")[1])[
+        "video_sources"
+    ][0]["source_id"]
+
+
+async def test_real_onebot_json_event_reaches_video_resource_prompt(plugin):
+    url = "https://b23.tv/abc?share_source=qq&sign=secret"
+    event = Event(messages=[Plain("看看这个视频")])
+    event.message_obj = SimpleNamespace(
+        raw_message=OneBotEvent(
+            {
+                "post_type": "message",
+                "message_type": "private",
+                "message": [
+                    {
+                        "type": "json",
+                        "data": {
+                            "data": json.dumps(
+                                {"meta": {"detail_1": {"qqdocurl": url}}}
+                            )
+                        },
+                    }
+                ],
+            }
+        )
+    )
+    source_id = await prepare_share(plugin, event)
+    assert plugin.share_sources[plugin._owner(event)][source_id][0] == url
+    assert plugin._state(event)["captured"]
+    assert plugin._state(event)["prepared"]
+
+
+async def test_share_registration_is_lazy_private_and_current_message_only(plugin):
+    url = "https://www.xiaohongshu.com/explore/test?xsec_token=secret"
+    event = Event(messages=[Json({"meta": {"detail": {"qqdocurl": url}}})])
+    plugin.downloads._download = AsyncMock()
+    source_id = await prepare_share(plugin, event)
+    assert plugin.share_sources[plugin._owner(event)][source_id][0] == url
+    request = ProviderRequest(prompt="继续")
+    await plugin.prepare_video_resources(Event(), request)
+    assert not request.extra_user_content_parts
+    assert plugin.downloads._download.await_count == 0
+    original = ProviderRequest(prompt="分析这个视频")
+    second = Event(messages=[Plain(url)])
+    await plugin.prepare_video_resources(second, original)
+    assert original.prompt == "分析这个视频"
+    assert "secret" not in original.extra_user_content_parts[0].text
+
+
+async def test_share_feature_can_be_disabled(plugin):
+    plugin.settings = replace(plugin.settings, share_links_enabled=False)
+    request = ProviderRequest(prompt="看视频")
+    await plugin.prepare_video_resources(
+        Event(messages=[Plain("https://b23.tv/abc")]), request
+    )
+    assert not request.extra_user_content_parts
+    assert not plugin.share_sources
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        {"user": "bob"},
+        {"origin": "other"},
+        {"user": "bob", "admin": True},
+    ],
+)
+async def test_share_source_cannot_be_borrowed(plugin, other):
+    source_id = await prepare_share(
+        plugin, Event(messages=[Plain("https://b23.tv/abc")])
+    )
+    plugin.downloads._download = AsyncMock()
+    result = await plugin.video_overview(Event(**other), source_id)
+    assert data(result)["error"]["code"] == "PERMISSION_DENIED"
+    assert plugin.downloads._download.await_count == 0
+
+
+async def test_expired_source_and_direct_url_are_rejected(plugin):
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+    owner = plugin._owner(event)
+    url, _ = plugin.share_sources[owner][source_id]
+    plugin.share_sources[owner][source_id] = (url, 0)
+    assert (
+        data(await plugin.video_overview(event, source_id))["error"]["code"]
+        == "PERMISSION_DENIED"
+    )
+    assert (await plugin.video_overview(event, url)).isError
+
+
+async def test_downloaded_share_reuses_overview_inspect_and_asr(
+    plugin, audio_video, asr_provider
+):
+    plugin.settings = replace(
+        plugin.settings, asr_enabled=True, asr_provider_id="test-asr"
+    )
+    plugin.context.get_provider_by_id.return_value = asr_provider
+
+    async def copy_video(url, directory):
+        directory.mkdir()
+        output = directory / "media.mp4"
+        shutil.copyfile(audio_video, output)
+        return output
+
+    plugin.downloads._download = AsyncMock(side_effect=copy_video)
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+    result = await plugin.video_overview(event, source_id)
+    assert not result.isError
+    overview = data(result)
+    path = overview["video_path"]
+    assert Path(path).is_relative_to(plugin.downloads.root)
+    assert overview["asr"]["segments"][0]["text"]
+    assert plugin.downloads._download.await_count == 1
+    record_tool_result(event, "video_overview", result)
+    assert image_parts(event)
+    assert "不重复" in (await plugin.video_overview(event, source_id)).content[0].text
+    assert plugin.downloads._download.await_count == 1
+    other_question = Event()
+    inspected = await plugin.video_inspect(
+        other_question, path, mode="timestamps", times_sec=[1.5]
+    )
+    assert not inspected.isError
+    assert data(inspected)["asr"]["segments"][0]["text"]
+    denied = await plugin.video_inspect(
+        Event(user="bob"), path, mode="timestamps", times_sec=[1]
+    )
+    assert data(denied)["error"]["code"] == "PERMISSION_DENIED"
+    assert not plugin.downloads.active
+
+
+async def test_share_download_uses_tool_deadline_and_cancellation(plugin):
+    plugin.settings = replace(plugin.settings, tool_timeout=0.05)
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+    cancelled = asyncio.Event()
+
+    async def slow_download(*_):
+        try:
+            await asyncio.sleep(60)
+        finally:
+            cancelled.set()
+
+    plugin.downloads._download = slow_download
+    result = await plugin.video_overview(event, source_id)
+    assert data(result)["error"]["code"] == "TIMEOUT"
+    assert cancelled.is_set()
+    assert not plugin.downloads.active
+    assert not plugin.tasks
+    assert not plugin._state(event)["overviews"]
+
+
+async def test_download_and_processing_share_one_time_budget(plugin, tmp_path):
+    plugin.settings = replace(plugin.settings, tool_timeout=0.15)
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+
+    async def slow_download(url, directory):
+        await asyncio.sleep(0.10)
+        directory.mkdir()
+        path = directory / "media.mp4"
+        path.write_bytes(b"video")
+        return path
+
+    async def slow_overview(*_):
+        await asyncio.sleep(0.10)
+        raise AssertionError("处理阶段不应重新获得完整时间预算")
+
+    plugin.downloads._download = slow_download
+    plugin.media.probe = AsyncMock(return_value=SimpleNamespace(duration=3))
+    plugin.service.overview = slow_overview
+    result = await plugin.video_overview(event, source_id)
+    assert data(result)["error"]["code"] == "TIMEOUT"
+    assert not plugin.downloads.active
+
+
+async def test_downloaded_duration_is_checked_before_authorization(
+    plugin, sample_video
+):
+    plugin.settings = replace(plugin.settings, download_max_duration=1)
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+
+    async def fake_download(url, directory):
+        directory.mkdir()
+        path = directory / "media.mp4"
+        shutil.copyfile(sample_video, path)
+        return path
+
+    plugin.downloads._download = fake_download
+    result = await plugin.video_overview(event, source_id)
+    assert "时长上限" in data(result)["error"]["message"]
+    assert not plugin.resources.get(plugin._owner(event))

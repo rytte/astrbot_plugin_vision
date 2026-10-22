@@ -1,6 +1,12 @@
 {
   "ffmpeg_path": {"type": "string", "description": "FFmpeg 可执行文件路径", "hint": "留空从 PATH 查找；容器部署时填写容器内路径。", "default": ""},
   "ffprobe_path": {"type": "string", "description": "ffprobe 可执行文件路径", "hint": "留空从 PATH 查找。", "default": ""},
+  "share_links_enabled": {"type": "bool", "description": "启用分享链接视频解析", "hint": "识别文本、分享卡片和引用中的链接，调用概览时才使用 yt-dlp 下载。", "default": true},
+  "download_max_mb": {"type": "int", "description": "分享视频大小上限（MB）", "default": 200, "condition": {"share_links_enabled": true}},
+  "download_max_duration": {"type": "float", "description": "分享视频时长上限（秒）", "default": 1800.0, "condition": {"share_links_enabled": true}},
+  "download_cache_max_mb": {"type": "int", "description": "分享视频缓存容量（MB）", "hint": "空闲时清理，授权与缓存有效期沿用 cache_ttl。", "default": 1024, "condition": {"share_links_enabled": true}},
+  "download_cookie_file": {"type": "string", "description": "yt-dlp Cookie 文件路径", "hint": "可选，填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径，用于需要登录的平台。", "default": "", "condition": {"share_links_enabled": true}},
+  "download_allow_fake_ip": {"type": "bool", "description": "兼容本机代理 Fake-IP DNS", "hint": "仅在代理使用 198.18.0.0/15 虚拟 DNS 时开启；仍拒绝其他内网地址和直接 Fake-IP 链接。", "default": false, "condition": {"share_links_enabled": true}},
   "overview_model_enabled": {"type": "bool", "description": "启用概览看图模型", "hint": "开启后显示模型选择项，由所选模型生成视频概览文字。关闭时概览图片直接交给主模型，已选模型会保留。仅影响 video_overview。", "default": false},
   "overview_provider_id": {"type": "string", "description": "概览看图模型", "hint": "选择已配置且支持图片的模型生成带时间戳的文字概览。留空时由主模型看图；调用失败直接报错，回看仍返回原图。", "default": "", "_special": "select_provider", "condition": {"overview_model_enabled": true}},
   "asr_enabled": {"type": "bool", "description": "启用 ASR 语音增强", "hint": "开启后显示 ASR 选择项。仅在已选择的 AstrBot 语音识别提供商可用时转写视频音轨，辅助概览和回看；关闭时不提取音频、不调用 ASR。", "default": false},
