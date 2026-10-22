@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -38,6 +39,54 @@ def sample_video(tmp_path, ffmpeg):
             "libx264",
             "-pix_fmt",
             "yuv420p",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    return output
+
+
+@pytest.fixture
+def asr_provider():
+    from astrbot.api.provider import STTProvider
+
+    provider = Mock(spec=STTProvider)
+    provider.provider_config = {
+        "id": "test-asr",
+        "enable": True,
+        "key": ["private-key"],
+    }
+    provider.get_model.return_value = "test-speech-model"
+    provider.get_text = AsyncMock(return_value="测试语音转写：请观察画面。")
+    return provider
+
+
+@pytest.fixture
+def audio_video(tmp_path, ffmpeg, sample_video):
+    output = tmp_path / "video with audio.mp4"
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            str(sample_video),
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-shortest",
             str(output),
         ],
         check=True,

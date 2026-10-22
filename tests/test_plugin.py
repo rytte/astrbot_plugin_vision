@@ -5,7 +5,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from astrbot.api import AstrBotConfig
@@ -97,6 +97,7 @@ def plugin(tmp_path, monkeypatch):
     )
     context = SimpleNamespace(
         llm_generate=AsyncMock(),
+        get_provider_by_id=Mock(return_value=None),
         provider_manager=SimpleNamespace(llm_tools=llm_tools),
         registered_web_apis=[],
     )
@@ -166,6 +167,97 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert Settings.from_mapping(config) == Settings()
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""
+    assert schema["asr_enabled"]["type"] == "bool"
+    assert schema["asr_enabled"]["default"] is False
+    assert schema["asr_provider_id"]["_special"] == "select_provider_stt"
+    assert schema["asr_provider_id"]["condition"] == {"asr_enabled": True}
+
+
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_asr_enriches_overview_and_deduplicates_inspect(
+    plugin, audio_video, asr_provider, delegated
+):
+    plugin.settings = replace(
+        plugin.settings,
+        asr_enabled=True,
+        asr_provider_id="test-asr",
+        overview_provider_id="configured-vision" if delegated else "",
+    )
+    plugin.context.get_provider_by_id.return_value = asr_provider
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        role="assistant", completion_text="结合转写可见画面颜色变化。"
+    )
+    event = Event(admin=True)
+    result = await plugin.video_overview(event, str(audio_video))
+    assert not result.isError
+    overview = data(result)
+    assert overview["asr"]["status"] == "success"
+    assert overview["asr"]["segments"][0]["text"] == asr_provider.get_text.return_value
+    record_tool_result(event, "video_overview", result)
+    if delegated:
+        call = plugin.context.llm_generate.call_args.kwargs
+        model_input = json.loads(call["prompt"].split("\n", 1)[1])
+        assert model_input["asr"] == overview["asr"]
+        assert "不是逐字" in call["system_prompt"]
+    else:
+        assert image_parts(event)
+    inspected = await plugin.video_inspect(
+        event, str(audio_video), mode="range", times_sec=[0, 1]
+    )
+    assert not inspected.isError
+    assert data(inspected)["asr"]["segments"] == []
+    assert data(inspected)["asr"]["skipped_already_provided_count"] == 1
+    record_tool_result(event, "video_inspect", inspected)
+    serialized = json.dumps(
+        [message.model_dump() for message in event.agent_context.messages],
+        ensure_ascii=False,
+    )
+    assert serialized.count(asr_provider.get_text.return_value) == 1
+    asr_provider.get_text.assert_awaited_once()
+    # 新问题仍可读取转写，但复用磁盘缓存，不再调用 ASR。
+    other_event = Event(admin=True)
+    repeated = await plugin.video_inspect(
+        other_event, str(audio_video), mode="timestamps", times_sec=[1]
+    )
+    assert data(repeated)["asr"]["cache_hit_count"] == 1
+    assert data(repeated)["asr"]["segments"] == overview["asr"]["segments"]
+    asr_provider.get_text.assert_awaited_once()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "no_audio", "failed", "timeout"])
+async def test_asr_failure_keeps_visual_result(
+    plugin, audio_video, sample_video, asr_provider, failure, monkeypatch
+):
+    plugin.settings = replace(
+        plugin.settings, asr_enabled=True, asr_provider_id="test-asr"
+    )
+    plugin.context.get_provider_by_id.return_value = asr_provider
+    if failure == "unavailable":
+        plugin.context.get_provider_by_id.return_value = None
+    elif failure == "failed":
+        asr_provider.get_text.side_effect = RuntimeError("private-key")
+    elif failure == "timeout":
+        monkeypatch.setattr(plugin.asr, "_chunk", AsyncMock(side_effect=TimeoutError))
+    event = Event(admin=True)
+    path = sample_video if failure == "no_audio" else audio_video
+    result = await plugin.video_overview(event, str(path))
+    assert not result.isError
+    assert data(result)["asr"]["status"] == failure
+    record_tool_result(event, "video_overview", result)
+    assert image_parts(event)
+    assert "private-key" not in result.content[0].text
+
+
+async def test_unauthorized_video_never_calls_asr(plugin, audio_video, asr_provider):
+    plugin.settings = replace(
+        plugin.settings, asr_enabled=True, asr_provider_id="test-asr"
+    )
+    plugin.context.get_provider_by_id.return_value = asr_provider
+    result = await plugin.video_overview(Event(), str(audio_video))
+    assert result.isError
+    assert data(result)["error"]["code"] == "PERMISSION_DENIED"
+    plugin.context.get_provider_by_id.assert_not_called()
+    asr_provider.get_text.assert_not_awaited()
 
 
 async def test_plugin_details_list_both_model_tools_without_instantiation():
@@ -349,9 +441,24 @@ async def test_missing_agent_context_fails_before_extracting_frames(
         ("video_inspect", "timestamps", True, "frames"),
     ],
 )
+@pytest.mark.parametrize("asr_enabled", [False, True])
 async def test_real_agent_loop_receives_images_without_generic_send_prompt(
-    plugin, sample_video, tool_name, mode, invalid_first, output_mode
+    plugin,
+    sample_video,
+    audio_video,
+    asr_provider,
+    tool_name,
+    mode,
+    invalid_first,
+    output_mode,
+    asr_enabled,
 ):
+    if asr_enabled:
+        sample_video = audio_video
+        plugin.settings = replace(
+            plugin.settings, asr_enabled=True, asr_provider_id="test-asr"
+        )
+        plugin.context.get_provider_by_id.return_value = asr_provider
     if output_mode == "grid":
         enable_grid(plugin)
     event = Event(admin=True, agent=False, messages=[Video(file=str(sample_video))])
@@ -468,6 +575,13 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     serialized = json.dumps([message.model_dump() for message in messages])
     assert all(serialized.count(frame["frame_id"]) == 1 for frame in frames)
+    if asr_enabled:
+        assert metadata["asr"]["status"] == "success"
+        assert (
+            serialized.count(json.dumps(asr_provider.get_text.return_value)[1:-1]) == 1
+        )
+    else:
+        assert "asr" not in metadata
     assert "Image returned and cached" not in serialized
     assert "Review the image below" not in serialized
     assert "send_message_to_user" not in serialized
@@ -495,6 +609,8 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     assert history[image_index]["content"] == image_message.model_dump()["content"]
     saved = json.dumps(history)
     assert all(saved.count(frame["frame_id"]) == 1 for frame in frames)
+    if asr_enabled:
+        assert saved.count(json.dumps(asr_provider.get_text.return_value)[1:-1]) == 1
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])

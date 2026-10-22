@@ -11,6 +11,8 @@ class Settings:
     ffprobe_path: str = ""
     allowed_video_roots: tuple[str, ...] = ()
     overview_provider_id: str = ""
+    asr_enabled: bool = False
+    asr_provider_id: str = ""
     overview_output_mode: str = "frames"
     overview_interval: float = 4.0
     overview_max_frames: int = 200
@@ -40,6 +42,9 @@ class Settings:
                 ):
                     raise ValueError("allowed_video_roots 必须是非空目录字符串的列表")
                 value = tuple(root.strip() for root in value)
+            elif isinstance(getattr(defaults, field.name), bool):
+                if not isinstance(value, bool):
+                    raise ValueError(f"{field.name} 必须是布尔值")
             elif isinstance(getattr(defaults, field.name), str):
                 if not isinstance(value, str):
                     raise ValueError(f"{field.name} 必须是字符串")

@@ -18,6 +18,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_t
 from mcp.types import CallToolResult, TextContent
 
 from .agent_images import ToolImageBuffer, defer_tool_images
+from .asr import VideoASR
 from .config import Settings
 from .debug import DebugSessions
 from .debug_web import DebugWeb
@@ -65,6 +66,7 @@ class VisionPlugin(Star):
             roots,
         )
         self.service = VideoService(self.media)
+        self.asr = VideoASR(self.media)
         self.resources: dict[tuple[str, str], dict[str, tuple[int, int, float]]] = {}
         self.tasks: set[asyncio.Task] = set()
         self.slots = asyncio.Semaphore(self.settings.max_concurrency)
@@ -114,6 +116,7 @@ class VisionPlugin(Star):
                 "inspect_calls": 0,
                 "seen": set(),
                 "overviews": set(),
+                "asr_seen": set(),
                 "lock": asyncio.Lock(),
             }
             event.set_extra("vision_request_state", state)
@@ -267,11 +270,13 @@ class VisionPlugin(Star):
                         state["inspect_calls"] -= 1
                     raise
                 if action == "overview" and self.settings.overview_provider_id:
+                    await self._enhance_asr(event, result, deadline)
                     content = await asyncio.wait_for(
                         self._describe_overview(event, result),
                         max(0.0, deadline - asyncio.get_running_loop().time()),
                     )
                     state["overviews"].add(identity)
+                    self._remember_asr(event, result)
                     return content
                 if action == "overview":
                     result.data["overview_mode"] = "direct"
@@ -329,6 +334,7 @@ class VisionPlugin(Star):
                             ),
                         ]
                     )
+                await self._enhance_asr(event, result, deadline)
                 if image_parts:
                     image_parts.insert(
                         0,
@@ -349,6 +355,7 @@ class VisionPlugin(Star):
                 state["seen"].update(frame.frame_id for frame in frames)
                 if action == "overview":
                     state["overviews"].add(identity)
+                self._remember_asr(event, result)
                 return CallToolResult(
                     content=[
                         TextContent(
@@ -395,6 +402,26 @@ class VisionPlugin(Star):
                     text=json.dumps(payload, ensure_ascii=False),
                 )
             ],
+        )
+
+    async def _enhance_asr(
+        self, event: AstrMessageEvent, result: VideoResult, deadline: float
+    ) -> None:
+        audio = await self.asr.enhance(
+            self.context,
+            self.settings,
+            result,
+            deadline,
+            self._state(event)["asr_seen"],
+        )
+        if audio is not None:
+            # 转写只在工具结果中提供，不再复制进 user 图片消息。
+            result.data["asr"] = audio
+
+    def _remember_asr(self, event: AstrMessageEvent, result: VideoResult) -> None:
+        self._state(event)["asr_seen"].update(
+            segment["segment_id"]
+            for segment in result.data.get("asr", {}).get("segments", [])
         )
 
     def _inspect_argument_error(
@@ -467,7 +494,7 @@ class VisionPlugin(Star):
     async def video_overview(
         self, event: AstrMessageEvent, video_path: str
     ) -> CallToolResult:
-        """查看本地视频的全片概览。未配置概览看图模型时返回带时间戳的图片，配置后返回指定模型生成的文字概览及帧索引。混合定时和场景变化抽帧，默认间隔4秒、最多200帧；超预算时降低密度但覆盖全片。概览不是完整事件记录，没看到不代表没发生，证据不足时调用video_inspect核验原图。相同问题不重复获取概览。
+        """查看本地视频的全片概览。未配置概览看图模型时返回带时间戳的图片，配置后返回指定模型生成的文字概览及帧索引。启用且配置可用 ASR 时附带音轨分段转写；分段范围不是逐字时间戳。混合定时和场景变化抽帧，默认间隔4秒、最多200帧；超预算时降低密度但覆盖全片。概览不是完整事件记录，没看到不代表没发生，证据不足时调用video_inspect核验原图。相同问题不重复获取概览。
 
         Args:
             video_path(string): 视频资源提示中的真实本地路径，不是网址；不要猜测其他用户的路径。

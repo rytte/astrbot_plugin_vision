@@ -3,6 +3,8 @@
   "ffprobe_path": {"type": "string", "description": "ffprobe 可执行文件路径", "hint": "留空从 PATH 查找。", "default": ""},
   "allowed_video_roots": {"type": "list", "description": "额外允许读取的视频目录", "hint": "AstrBot data 和 temp 目录默认允许。仅填写已存在的绝对目录；普通用户仍只能访问自己在当前会话提供的视频，管理员可读取允许目录内的文件。", "default": [], "items": {"type": "string"}},
   "overview_provider_id": {"type": "string", "description": "概览看图模型（可选）", "hint": "从 AstrBot 已配置的模型中选择，所选模型必须支持图片。留空时直接把概览图片交给主模型；选择后由该模型生成带时间戳的描述，主模型只接收文字。仅影响 video_overview，video_inspect 仍返回原图。调用失败会报错，不自动改为主模型看图。", "default": "", "_special": "select_provider"},
+  "asr_enabled": {"type": "bool", "description": "启用 ASR 语音增强", "hint": "开启后显示 ASR 选择项。仅在已选择的 AstrBot 语音识别提供商可用时转写视频音轨，辅助概览和回看；关闭时不提取音频、不调用 ASR。", "default": false},
+  "asr_provider_id": {"type": "string", "description": "ASR 语音识别提供商", "hint": "选择 AstrBot 已配置并启用的语音识别（STT/ASR）提供商，无需另填密钥。留空或提供商不可用时只分析画面。音频按最多 30 秒分段转写，时间范围不是逐字时间戳；转写失败不会中断画面分析。", "default": "", "_special": "select_provider_stt", "condition": {"asr_enabled": true}},
   "overview_interval": {"type": "float", "description": "概览默认采样间隔（秒）", "default": 4.0},
   "overview_output_mode": {"type": "string", "description": "概览图片输出模式", "options": ["frames", "grid"], "labels": ["独立帧", "九宫格"], "hint": "独立帧：逐张输出；九宫格：按时间顺序每组最多 9 帧拼图，编号和实际时间戳位于画面外。保留抽帧后的像素尺寸，以 PNG 无损拼接；不额外缩放。仅影响概览，两种看图模型模式均支持；详细回看仍用独立帧。拼图不保证节省视觉 token，模型仍可能缩放大图。", "default": "frames"},
   "overview_max_frames": {"type": "int", "description": "概览总帧数上限", "hint": "包含固定、边界和变化帧。超预算增大间隔，不截掉后半段。注意模型自身的图片数量和上下文限制。", "default": 200},
@@ -14,6 +16,6 @@
   "inspect_max_calls": {"type": "int", "description": "单个问题的回看次数上限", "hint": "同一问题中所有视频共享次数；参数校验失败返还次数，处理失败或超时仍计入；新消息重新计数。", "default": 3},
   "tool_timeout": {"type": "float", "description": "单次工具调用总超时（秒）", "default": 300.0},
   "max_concurrency": {"type": "int", "description": "并发处理与子进程数量上限", "default": 2},
-  "cache_ttl": {"type": "float", "description": "抽帧缓存与会话授权有效期（秒）", "default": 3600.0},
-  "cache_max_mb": {"type": "int", "description": "抽帧缓存容量上限（MB）", "hint": "启动及工具空闲时清理过期缓存，超容量时从最旧缓存开始清理；不会删除源视频。", "default": 512}
+  "cache_ttl": {"type": "float", "description": "图片、转写缓存与会话授权有效期（秒）", "default": 3600.0},
+  "cache_max_mb": {"type": "int", "description": "图片与转写缓存容量上限（MB）", "hint": "启动及工具空闲时清理过期缓存，超容量时从最旧缓存开始清理；不会删除源视频。", "default": 512}
 }
