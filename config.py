@@ -9,7 +9,6 @@ from dataclasses import dataclass, fields
 class Settings:
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
-    allowed_video_roots: tuple[str, ...] = ()
     overview_model_enabled: bool = False
     overview_provider_id: str = ""
     asr_enabled: bool = False
@@ -32,18 +31,14 @@ class Settings:
     def from_mapping(cls, values: Mapping) -> Settings:
         defaults = cls()
         unknown = set(values) - {field.name for field in fields(cls)}
+        # 兼容旧配置中的已移除项，不再用它扩展读取范围。
+        unknown.discard("allowed_video_roots")
         if unknown:
             raise ValueError("未知视频理解配置：" + ", ".join(sorted(unknown)))
         normalized = {}
         for field in fields(cls):
             value = values.get(field.name, getattr(defaults, field.name))
-            if field.name == "allowed_video_roots":
-                if not isinstance(value, list | tuple) or any(
-                    not isinstance(root, str) or not root.strip() for root in value
-                ):
-                    raise ValueError("allowed_video_roots 必须是非空目录字符串的列表")
-                value = tuple(root.strip() for root in value)
-            elif isinstance(getattr(defaults, field.name), bool):
+            if isinstance(getattr(defaults, field.name), bool):
                 if not isinstance(value, bool):
                     raise ValueError(f"{field.name} 必须是布尔值")
             elif isinstance(getattr(defaults, field.name), str):

@@ -75,7 +75,6 @@ def test_scene_matching_interval_is_tagged_as_key_even_at_budget():
         {"overview_max_frames": True},
         {"inspect_max_calls": 0},
         {"scene_threshold": 1},
-        {"allowed_video_roots": "data"},
         {"typo": 1},
         {"max_edge_limit": 128},
         {"overview_model_enabled": "true"},

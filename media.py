@@ -87,7 +87,9 @@ class FFmpegMedia:
         except (OSError, RuntimeError, ValueError) as exc:
             raise VideoError("视频文件不存在或路径无效") from exc
         if not any(path.is_relative_to(root) for root in self.allowed_roots):
-            raise VideoError("视频不在允许读取的目录中，请配置 allowed_video_roots")
+            raise VideoError(
+                "视频不在允许读取的目录中；仅支持 AstrBot data、temp 目录内的本地文件"
+            )
         if not path.is_file() or path.stat().st_size == 0:
             raise VideoError("路径必须指向非空的普通视频文件")
         return path

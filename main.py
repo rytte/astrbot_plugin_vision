@@ -55,11 +55,6 @@ class VisionPlugin(Star):
         roots = [Path(get_astrbot_data_path()), Path(get_astrbot_temp_path())]
         for root in roots:
             root.mkdir(parents=True, exist_ok=True)
-        for configured in self.settings.allowed_video_roots:
-            root = Path(configured).expanduser()
-            if not root.is_absolute() or not root.is_dir():
-                raise ValueError("allowed_video_roots 只接受已存在的绝对目录")
-            roots.append(root)
         self.media = FFmpegMedia(
             self.settings,
             StarTools.get_data_dir("astrbot_plugin_vision") / "frames",

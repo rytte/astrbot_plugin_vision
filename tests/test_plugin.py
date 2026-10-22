@@ -169,6 +169,7 @@ def test_configuration_schema_matches_defaults(tmp_path):
     )
     config = AstrBotConfig(str(tmp_path / "config.json"), schema=schema)
     assert Settings.from_mapping(config) == Settings()
+    assert "allowed_video_roots" not in schema
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""
     assert schema["overview_model_enabled"]["type"] == "bool"
@@ -180,6 +181,47 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert schema["asr_enabled"]["default"] is False
     assert schema["asr_provider_id"]["_special"] == "select_provider_stt"
     assert schema["asr_provider_id"]["condition"] == {"asr_enabled": True}
+
+
+async def test_removed_extra_directories_are_ignored_and_default_roots_still_apply(
+    plugin, tmp_path, monkeypatch
+):
+    data_root, temp_root = tmp_path / "data", tmp_path / "temp"
+    external = tmp_path / "external"
+    external.mkdir()
+    external_video = external / "video.mp4"
+    external_video.write_bytes(b"video")
+    monkeypatch.setattr(
+        "astrbot_plugin_vision.main.get_astrbot_data_path", lambda: str(data_root)
+    )
+    monkeypatch.setattr(
+        "astrbot_plugin_vision.main.get_astrbot_temp_path", lambda: str(temp_root)
+    )
+    legacy = {
+        "allowed_video_roots": [str(external), str(tmp_path / "missing-directory")]
+    }
+    migrated = VisionPlugin(plugin.context, legacy)
+    try:
+        assert migrated.settings == Settings()
+        assert migrated.media.allowed_roots == (
+            data_root.resolve(),
+            temp_root.resolve(),
+        )
+        for root in (data_root, temp_root):
+            local_video = root / "video.mp4"
+            local_video.write_bytes(b"video")
+            assert (
+                migrated._authorize(Event(admin=True), str(local_video)) == local_video
+            )
+            with pytest.raises(PermissionError, match="当前会话"):
+                migrated._authorize(Event(), str(local_video))
+        rejected = await migrated.video_overview(Event(admin=True), str(external_video))
+        assert rejected.isError
+        assert data(rejected)["error"]["code"] == "VIDEO_ERROR"
+        assert "data、temp" in data(rejected)["error"]["message"]
+        assert "allowed_video_roots" not in data(rejected)["error"]["message"]
+    finally:
+        await migrated.terminate()
 
 
 @pytest.mark.parametrize("delegated", [False, True])
