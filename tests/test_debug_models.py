@@ -5,7 +5,7 @@ import time
 import uuid
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import jwt
@@ -46,6 +46,251 @@ def model_context():
     )
     context.register_web_api = lambda *entry: context.registered_web_apis.append(entry)
     return context
+
+
+@pytest.fixture
+def speech_context(model_context, asr_provider):
+    model_context.get_all_stt_providers = lambda: [asr_provider]
+    model_context.get_provider_by_id = Mock(return_value=asr_provider)
+    return model_context
+
+
+@pytest.fixture
+async def speech_experiment(experiment, audio_video):
+    sessions, session = experiment
+    session.source.write_bytes(audio_video.read_bytes())
+    await sessions.reset(session, {})
+    await session.pipeline.run()
+    return sessions, session
+
+
+async def transcribe(sessions, session, context, identifier=None):
+    await sessions.models.start_asr(
+        session, context, session.revision, "test-asr", identifier or uuid.uuid4().hex
+    )
+    if session.task is not None:
+        await session.task
+    return session.model.asr_runs[-1]
+
+
+async def test_asr_is_explicit_and_same_transcript_is_used_for_both_image_modes(
+    speech_experiment, speech_context, asr_provider
+):
+    sessions, session = speech_experiment
+    plain = await prepare(sessions, session, speech_context)
+    assert plain["asr"] is None
+    assert "asr" not in json.loads(plain["prompt"].split("\n", 1)[1])
+    asr_provider.get_text.assert_not_awaited()
+    with pytest.raises(ValueError, match="先完成"):
+        await prepare(
+            sessions,
+            session,
+            speech_context,
+            asr_enabled=True,
+            asr_provider_id="test-asr",
+        )
+    audio = await transcribe(sessions, session, speech_context)
+    assert audio.status == "succeeded"
+    assert sessions.media.settings.asr_enabled is False
+    assert session.pipeline.settings.asr_enabled is False
+    asr_provider.get_text.assert_awaited_once()
+    assert session.model.prepared is None
+    assert "asr" not in session.pipeline.result.data
+    inputs = []
+    for mode in ("frames", "grid"):
+        prepared = await prepare(
+            sessions,
+            session,
+            speech_context,
+            mode,
+            asr_enabled=True,
+            asr_provider_id="test-asr",
+            asr_run_id=audio.id,
+        )
+        payload = json.loads(prepared["prompt"].split("\n", 1)[1])
+        assert payload["asr"] == audio.result
+        assert prepared["asr"]["provider"]["id"] == "test-asr"
+        assert prepared["asr"]["id"] == audio.id
+        record = await run(sessions, session, speech_context, prepared)
+        assert (
+            speech_context.llm_generate.call_args.kwargs["prompt"] == prepared["prompt"]
+        )
+        assert record.prepared.asr["segment_count"] == 1
+        inputs.append(prepared)
+    asr_provider.get_text.assert_awaited_once()
+    # 状态轮询不重复传输完整转写和提示词。
+    snapshot = sessions.snapshot(session)
+    assert snapshot["model"]["asr"]["segment_count"] == 1
+    assert asr_provider.get_text.return_value not in json.dumps(
+        snapshot, ensure_ascii=False
+    )
+    pure = await prepare(sessions, session, speech_context, asr_enabled=False)
+    assert "asr" not in json.loads(pure["prompt"].split("\n", 1)[1])
+    assert inputs[0]["asr"] == inputs[1]["asr"]
+    assert all(record.prepared.asr is not None for record in session.model.runs)
+
+
+async def test_asr_retries_use_cache_and_old_model_records_are_immutable(
+    speech_experiment, speech_context, asr_provider
+):
+    sessions, session = speech_experiment
+    identifier = uuid.uuid4().hex
+    audio = await transcribe(sessions, session, speech_context, identifier)
+    await sessions.models.start_asr(
+        session, speech_context, session.revision, "test-asr", identifier
+    )
+    assert len(session.model.asr_runs) == 1
+    prepared = await prepare(
+        sessions,
+        session,
+        speech_context,
+        asr_enabled=True,
+        asr_provider_id="test-asr",
+        asr_run_id=audio.id,
+    )
+    record = await run(sessions, session, speech_context, prepared)
+    original_prompt = record.prepared.request.prompt
+    retried = await transcribe(sessions, session, speech_context)
+    assert retried.result["cache_hit_count"] == 1
+    assert session.model.prepared is None
+    assert record.prepared.request.prompt == original_prompt
+    assert record.prepared.asr["id"] == audio.id
+    asr_provider.get_text.assert_awaited_once()
+    with pytest.raises(ValueError, match="先完成"):
+        await prepare(
+            sessions,
+            session,
+            speech_context,
+            asr_enabled=True,
+            asr_provider_id="test-asr",
+            asr_run_id=audio.id,
+        )
+
+
+@pytest.mark.parametrize("immediate", [True, False])
+async def test_asr_cancellation_preserves_frames_and_allows_retry(
+    speech_experiment, speech_context, asr_provider, immediate
+):
+    sessions, session = speech_experiment
+    started = asyncio.Event()
+
+    async def slow(path):
+        started.set()
+        await asyncio.Event().wait()
+
+    asr_provider.get_text.side_effect = slow
+    await sessions.models.start_asr(
+        session, speech_context, session.revision, "test-asr", uuid.uuid4().hex
+    )
+    if not immediate:
+        await asyncio.wait_for(started.wait(), 5)
+    await sessions.cancel(session)
+    assert session.model.asr_runs[-1].status == "cancelled"
+    assert not session.task and not session.operation and session.error is None
+    assert all(frame.path.is_file() for frame in session.pipeline.kept)
+    assert not list(session.pipeline.media.cache_dir.glob("*.wav"))
+    asr_provider.get_text.side_effect = None
+    assert (await transcribe(sessions, session, speech_context)).status == "succeeded"
+
+
+@pytest.mark.parametrize("operation", ["reset", "delete", "close"])
+async def test_asr_work_is_cancelled_when_session_is_reset_or_removed(
+    speech_experiment, speech_context, asr_provider, operation
+):
+    sessions, session = speech_experiment
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def slow(path):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    asr_provider.get_text.side_effect = slow
+    await sessions.models.start_asr(
+        session, speech_context, session.revision, "test-asr", uuid.uuid4().hex
+    )
+    await asyncio.wait_for(started.wait(), 5)
+    if operation == "reset":
+        await sessions.reset(session, {})
+        assert not session.model.asr_runs
+        assert not list(session.pipeline.media.cache_dir.iterdir())
+    elif operation == "delete":
+        await sessions.delete(session)
+        assert not session.directory.exists()
+    else:
+        await sessions.close()
+        assert not session.directory.exists()
+    assert cancelled.is_set()
+    assert not session.task
+
+
+@pytest.mark.parametrize("outcome", ["no_audio", "failed", "timeout", "partial"])
+async def test_asr_outcomes_remain_visible_and_do_not_prevent_visual_testing(
+    speech_experiment, speech_context, asr_provider, outcome, monkeypatch
+):
+    sessions, session = speech_experiment
+    payload = {
+        "provider_id": "test-asr",
+        "status": outcome,
+        "segments": [
+            {"segment_id": "segment", "start_sec": 0, "end_sec": 3, "text": "部分转写"}
+        ]
+        if outcome == "partial"
+        else [],
+        "complete": outcome == "no_audio",
+        "message": "转写状态说明",
+    }
+    monkeypatch.setattr(
+        "astrbot_plugin_vision.debug_models.VideoASR.enhance",
+        AsyncMock(return_value=payload),
+    )
+    audio = await transcribe(sessions, session, speech_context)
+    assert audio.result["status"] == outcome
+    prepared = await prepare(
+        sessions,
+        session,
+        speech_context,
+        asr_enabled=True,
+        asr_provider_id="test-asr",
+        asr_run_id=audio.id,
+    )
+    assert json.loads(prepared["prompt"].split("\n", 1)[1])["asr"] == payload
+    record = await run(sessions, session, speech_context, prepared)
+    assert record.status == "succeeded"
+
+
+async def test_invalid_asr_requests_never_call_provider(
+    speech_experiment, speech_context, asr_provider, monkeypatch
+):
+    sessions, session = speech_experiment
+    for provider_id, identifier, revision in [
+        ("missing", uuid.uuid4().hex, session.revision),
+        ("vision-test", uuid.uuid4().hex, session.revision),
+        ("test-asr", "invalid", session.revision),
+        ("test-asr", uuid.uuid4().hex, session.revision - 1),
+    ]:
+        with pytest.raises(ValueError):
+            await sessions.models.start_asr(
+                session, speech_context, revision, provider_id, identifier
+            )
+    with pytest.raises(ValueError, match="布尔"):
+        await prepare(sessions, session, speech_context, asr_enabled="true")
+    session.pipeline.completed -= 1
+    with pytest.raises(ValueError, match="本地流水线"):
+        await transcribe(sessions, session, speech_context)
+    session.pipeline.completed += 1
+    asr_provider.get_text.assert_not_awaited()
+    asr_provider.provider_config["enable"] = False
+    assert sessions.models.asr_providers(speech_context) == []
+    with pytest.raises(ValueError, match="未启用"):
+        await transcribe(sessions, session, speech_context)
+    asr_provider.provider_config["enable"] = True
+    monkeypatch.setattr("astrbot_plugin_vision.debug_models.MAX_ASR_RUNS", 1)
+    await transcribe(sessions, session, speech_context)
+    with pytest.raises(ValueError, match="20 次转写"):
+        await transcribe(sessions, session, speech_context)
 
 
 @pytest.fixture
@@ -109,10 +354,16 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
         payload = json.loads(prepared["prompt"].split("\n", 1)[1])
         assert [frame["frame_id"] for frame in payload["frames"]] == original_ids
         assert all(
-            "x" not in cell and "y" not in cell
+            not {"x", "y", "width", "height"}.intersection(cell)
             for image in payload["presentation"]["images"]
             for cell in image["cells"]
         )
+        if mode == "grid":
+            assert all(
+                (image["frame_width"], image["frame_height"])
+                == (session.pipeline.kept[0].width, session.pipeline.kept[0].height)
+                for image in payload["presentation"]["images"]
+            )
         image = await sessions.image(session, "model", 0, "full", 0, prepared["id"])
         assert image["image"]["cells"] == payload["presentation"]["images"][0]["cells"]
         assert (
@@ -257,10 +508,10 @@ async def test_reset_and_delete_cancel_model_tasks(experiment, model_context):
 
 
 async def test_model_routes_require_auth_csrf_and_keep_records_private(
-    experiment, model_context
+    speech_experiment, speech_context, asr_provider
 ):
-    sessions, session = experiment
-    context = model_context
+    sessions, session = speech_experiment
+    context = speech_context
     web = DebugWeb(context, sessions)
     web.register()
     app = FastAPI()
@@ -286,10 +537,14 @@ async def test_model_routes_require_auth_csrf_and_keep_records_private(
         ).status_code == 403
         state = (await client.get("/debug/state", headers=headers)).json()["data"]
         assert [provider["id"] for provider in state["providers"]] == ["vision-test"]
+        assert state["asr_providers"] == [
+            {"id": "test-asr", "model": "test-speech-model"}
+        ]
+        assert state["asr_enabled"] is False
         body = {
             "id": session.id,
             "csrf": state["csrf"],
-            "revision": 0,
+            "revision": session.revision,
             "provider_id": "vision-test",
             "question": "请描述颜色变化",
             "mode": "grid",
@@ -300,7 +555,8 @@ async def test_model_routes_require_auth_csrf_and_keep_records_private(
         assert response.status_code == 403
         response = await client.post("/debug/model-prepare", json=body, headers=headers)
         prepared = response.json()["data"]
-        model_context.llm_generate.assert_not_awaited()
+        context.llm_generate.assert_not_awaited()
+        asr_provider.get_text.assert_not_awaited()
         response = await client.post(
             "/debug/model-run",
             json={**body, "preview_id": prepared["id"], "run_id": uuid.uuid4().hex},
@@ -316,10 +572,68 @@ async def test_model_routes_require_auth_csrf_and_keep_records_private(
         assert exported["runs"][0]["answer"]
         assert exported["runs"][0]["input"]["prompt"] == prepared["prompt"]
         assert "private-key" not in json.dumps(exported)
+        asr_body = {**body, "provider_id": "test-asr", "run_id": uuid.uuid4().hex}
+        assert (await client.post("/debug/model-asr", json=asr_body)).status_code == 403
+        assert (
+            await client.post(
+                "/debug/model-asr", json={**asr_body, "csrf": "wrong"}, headers=headers
+            )
+        ).status_code == 403
+        asr_provider.get_text.assert_not_awaited()
+        assert (
+            await client.post("/debug/model-asr", json=asr_body, headers=headers)
+        ).status_code == 200
+        assert (
+            await client.post("/debug/model-asr", json=asr_body, headers=headers)
+        ).status_code == 200
+        if session.task is not None:
+            await session.task
+        asr_provider.get_text.assert_awaited_once()
+        audio_state = (
+            await client.get(
+                "/debug/session", params={"id": session.id}, headers=headers
+            )
+        ).json()["data"]
+        assert audio_state["model"]["asr"]["segment_count"] == 1
+        assert asr_provider.get_text.return_value not in json.dumps(
+            audio_state, ensure_ascii=False
+        )
+        prepared_audio = (
+            await client.post(
+                "/debug/model-prepare",
+                json={
+                    **body,
+                    "asr_enabled": True,
+                    "asr_provider_id": "test-asr",
+                    "asr_run_id": asr_body["run_id"],
+                },
+                headers=headers,
+            )
+        ).json()["data"]
+        assert (
+            json.loads(prepared_audio["prompt"].split("\n", 1)[1])["asr"]["segments"][
+                0
+            ]["text"]
+            == asr_provider.get_text.return_value
+        )
+        exported = (
+            await client.get(
+                "/debug/model-records", params={"id": session.id}, headers=headers
+            )
+        ).json()["data"]
+        assert exported["asr_runs"][0]["result"]["segments"]
+        assert "private-key" not in json.dumps(exported)
         session.owner = "another-admin"
         assert (
             await client.get(
                 "/debug/model-records", params={"id": session.id}, headers=headers
+            )
+        ).status_code == 400
+        assert (
+            await client.get(
+                "/debug/model-record",
+                params={"id": session.id, "record": asr_body["run_id"]},
+                headers=headers,
             )
         ).status_code == 400
     await web.close()

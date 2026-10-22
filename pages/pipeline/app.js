@@ -9,8 +9,8 @@ let videoURL = null, selectedVideoSession = null, dialogVersion = 0, pairIndex =
 let renderKey = "", activeImages = 0;
 const imageCache = new Map(), imageQueue = [], pages = new Map();
 const modelDetails = new Map();
-let modelDraft = {provider_id: "", question: "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: "frames"};
-let modelPreview = null, selectedRuns = [], pendingModelRun = null;
+let modelDraft = {provider_id: "", question: "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: "frames", asr_enabled: false, asr_provider_id: ""};
+let modelPreview = null, selectedRuns = [], pendingModelRun = null, pendingASRRun = null;
 const pageWriter = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("");
 let pageSequence = 0, restoringPage = true, pageSaveScheduled = false, lastPageState = "", videoPosition = 0;
 
@@ -65,7 +65,7 @@ function restorePageState(state) {
     if ((typeof value === "string" || typeof value === "number") && String(value).length <= 64) $(key).value = value;
   }
   const draft = state.model_draft;
-  if (draft && typeof draft.provider_id === "string" && typeof draft.question === "string" && ["frames", "grid"].includes(draft.mode)) modelDraft = {provider_id: draft.provider_id.slice(0, 1024), question: draft.question.slice(0, 4000), mode: draft.mode};
+  if (draft && typeof draft.provider_id === "string" && typeof draft.question === "string" && ["frames", "grid"].includes(draft.mode)) modelDraft = {provider_id: draft.provider_id.slice(0, 1024), question: draft.question.slice(0, 4000), mode: draft.mode, asr_enabled: typeof draft.asr_enabled === "boolean" ? draft.asr_enabled : modelDraft.asr_enabled, asr_provider_id: typeof draft.asr_provider_id === "string" ? draft.asr_provider_id.slice(0, 1024) : modelDraft.asr_provider_id};
   if (Number.isInteger(state.pair_index)) pairIndex = Math.max(0, Math.min(state.pair_index, session.dedup_trace.length - 1));
   if (Array.isArray(state.pages)) for (const entry of state.pages.slice(-64)) {
     if (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].length <= 256 && Number.isInteger(entry[1]) && entry[1] >= 0) pages.set(entry[0], entry[1]);
@@ -79,7 +79,7 @@ async function openSession(id) {
     const data = await bridge.apiGet("debug/session", {id});
     accept(data, false, true);
     const prepared = data.model.prepared;
-    if (prepared && prepared.provider.id === modelDraft.provider_id && prepared.question === modelDraft.question && prepared.mode === modelDraft.mode) {
+    if (prepared && inputMatchesDraft(prepared)) {
       try {
         const detail = await bridge.apiGet("debug/model-record", {id, record: prepared.id});
         if (session?.id === id && session.revision === data.revision) {modelPreview = detail.input; renderKey = ""; render();}
@@ -119,9 +119,9 @@ function accept(data, selectLatest = false, restoreView = false) {
   const advanced = session && data.completed > session.completed;
   session = data;
   if (changed) {
-    modelDetails.clear(); modelPreview = null; selectedRuns = []; pendingModelRun = null;
+    modelDetails.clear(); modelPreview = null; selectedRuns = []; pendingModelRun = null; pendingASRRun = null;
     const previous = data.model.prepared || data.model.runs.at(-1)?.input;
-    modelDraft = {provider_id: previous?.provider.id || config.default_provider_id || config.providers[0]?.id || "", question: previous?.question || "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: previous?.mode || data.parameters.overview_output_mode};
+    modelDraft = previous ? draftFromInput(previous) : {provider_id: config.default_provider_id || config.providers[0]?.id || "", question: "请按时间顺序描述视频中可见的事件，并标注实际时间戳。", mode: data.parameters.overview_output_mode, asr_enabled: Boolean(config.asr_enabled), asr_provider_id: config.asr_provider_id || config.asr_providers?.[0]?.id || ""};
     pages.clear();
     imageCache.clear();
     imageQueue.splice(0).forEach(job => job.reject(new Error("测试已切换")));
@@ -174,6 +174,8 @@ function updateControls() {
   for (const key of parameterNames) $(key).disabled = busy || running;
   document.querySelectorAll("#model-form input, #model-form select, #model-form textarea, #model-form button").forEach(element => {element.disabled = busy || running || session?.model.preparing;});
   if ($("model-call")) $("model-call").disabled = busy || running || session?.model.preparing || !previewMatches();
+  if ($("model-preview")) $("model-preview").disabled = busy || running || session?.model.preparing || (modelDraft.asr_enabled && !asrReady());
+  if ($("model-asr-run")) $("model-asr-run").disabled = busy || running || session?.model.preparing || !modelDraft.asr_provider_id;
 }
 function render() {
   schedulePageSave();
@@ -194,7 +196,7 @@ function render() {
   const status = $("run-status");
   status.hidden = !session?.running && !session?.error;
   status.className = "run-status" + (session?.running ? " running" : " error");
-  status.textContent = session?.running ? "正在执行「" + (session.operation === "model" ? "模型理解" : stageTitles[session.completed]) + "」…" : session?.error || "";
+  status.textContent = session?.running ? "正在执行「" + (session.operation === "model" ? "模型理解" : session.operation === "asr" ? "ASR 音轨转写" : stageTitles[session.completed]) + "」…" : session?.error || "";
   if (session) {
     $("timings").replaceChildren(node("span", "", "处理累计 " + time(session.processing_seconds)), node("span", "", "额外预览累计 " + time(session.preview_seconds)), node("span", "", "闲置 " + number(config.ttl_seconds / 60, 1) + " 分钟后清理"));
   }
@@ -344,11 +346,21 @@ function renderOutput(parent) {
   const actions = node("div", "inline-actions"); actions.append(button("导出调试记录 JSON", exportRecord)); parent.append(actions);
   note(parent, "稀疏采样只能帮助定位。采样帧中没有出现某事件，不能证明事件没有发生。");
 }
+function draftFromInput(input) {
+  return {provider_id: input.provider.id, question: input.question, mode: input.mode, asr_enabled: Boolean(input.asr), asr_provider_id: input.asr?.provider.id || config.asr_provider_id || config.asr_providers?.[0]?.id || ""};
+}
+function inputMatchesDraft(input) {
+  return input.provider.id === modelDraft.provider_id && input.question === modelDraft.question && input.mode === modelDraft.mode && Boolean(input.asr) === modelDraft.asr_enabled && (!modelDraft.asr_enabled || (input.asr.provider.id === modelDraft.asr_provider_id && input.asr.id === session?.model.asr?.id));
+}
 function previewMatches() {
-  return modelPreview && modelPreview.id === session?.model.prepared?.id && modelPreview.provider.id === modelDraft.provider_id && modelPreview.question === modelDraft.question && modelPreview.mode === modelDraft.mode;
+  return modelPreview && modelPreview.id === session?.model.prepared?.id && inputMatchesDraft(modelPreview);
+}
+function asrReady() {
+  const audio = session?.model.asr;
+  return audio && audio.provider.id === modelDraft.asr_provider_id && Boolean(audio.transcription_status) && !["queued", "running"].includes(audio.status);
 }
 function promptDetails(parent, input) {
-  const details = node("details", "model-prompts"); details.append(node("summary", "", "查看完整提示词与图片索引"));
+  const details = node("details", "model-prompts"); details.append(node("summary", "", "查看完整提示词、图片索引与语音输入"));
   details.append(node("h3", "", "系统提示词"), node("pre", "model-text", input.system_prompt), node("h3", "", "用户提示词（含时间戳和帧索引）"), node("pre", "model-text", input.prompt));
   parent.append(details);
 }
@@ -361,16 +373,29 @@ function renderModel(parent) {
   provider.value = modelDraft.provider_id; providerField.append(provider);
   const modeField = node("label", "field", "本次图片模式"), mode = node("select"); mode.id = "model-mode"; mode.append(new Option("独立帧", "frames"), new Option("九宫格", "grid")); mode.value = modelDraft.mode; modeField.append(mode); row.append(providerField, modeField);
   const questionField = node("label", "field", "测试问题"), question = node("textarea"); question.id = "model-question"; question.rows = 4; question.maxLength = 4000; question.required = true; question.value = modelDraft.question; questionField.append(question);
-  const onChange = () => {modelDraft = {provider_id: provider.value, mode: mode.value, question: question.value}; updateControls(); savePageState();};
+  const onChange = () => {modelDraft = {...modelDraft, provider_id: provider.value, mode: mode.value, question: question.value}; updateControls(); savePageState();};
   provider.addEventListener("change", onChange); mode.addEventListener("change", onChange); question.addEventListener("input", onChange);
-  const controls = node("div", "inline-actions"), preview = node("button", "button", "预览模型输入"); preview.type = "submit";
+  const speech = node("section", "asr-panel"), speechToggle = node("label", "asr-toggle"), useASR = node("input"); useASR.type = "checkbox"; useASR.id = "model-asr-enabled"; useASR.checked = modelDraft.asr_enabled;
+  speechToggle.append(useASR, node("span", "", "加入 ASR 语音转写（仅本次测试）")); speech.append(speechToggle);
+  useASR.addEventListener("change", () => {modelDraft.asr_enabled = useASR.checked; pendingModelRun = null; renderKey = ""; render();});
+  if (modelDraft.asr_enabled) {
+    const speechField = node("label", "field", "ASR 提供商"), speechProvider = node("select"); speechProvider.id = "model-asr-provider"; speechProvider.required = true; speechProvider.append(new Option("请选择 ASR", ""));
+    for (const item of config.asr_providers || []) speechProvider.append(new Option(item.id + (item.model ? " · " + item.model : ""), item.id));
+    speechProvider.value = modelDraft.asr_provider_id; speechField.append(speechProvider); speech.append(speechField);
+    speechProvider.addEventListener("change", () => {modelDraft.asr_provider_id = speechProvider.value; pendingASRRun = null; pendingModelRun = null; renderKey = ""; render();});
+    const speechActions = node("div", "inline-actions"), transcribe = button("转写音轨", () => action(startASR)); transcribe.id = "model-asr-run"; speechActions.append(transcribe); speech.append(speechActions);
+    note(speech, "先转写音轨，再预览带语音的模型输入。音频按最多 30 秒分段，范围不是逐字时间戳；切换图片模式复用转写。只有点击“转写音轨”才会请求 ASR，远程服务可能产生费用。");
+    if (!config.asr_providers?.length) note(speech, "没有可用的 ASR。请在 AstrBot 配置并启用语音识别提供商，再刷新列表；也可关闭此项测试纯画面。", true);
+    renderASR(speech);
+  }
+  const controls = node("div", "inline-actions"), preview = node("button", "button", "预览模型输入"); preview.type = "submit"; preview.id = "model-preview";
   const call = button("调用模型", () => action(startModel), "button primary"); call.id = "model-call";
   controls.append(preview, call, button("刷新模型列表", () => action(async () => {await loadSessions(); renderKey = ""; render();})));
-  form.append(row, questionField, controls); parent.append(form);
+  form.append(row, questionField, speech, controls); parent.append(form);
   form.addEventListener("submit", event => {event.preventDefault(); if (!form.reportValidity()) return; action(async () => {
     modelPreview = null; pendingModelRun = null;
     let prepared;
-    try {prepared = await post("model-prepare", {revision: session.revision, ...modelDraft});}
+    try {prepared = await post("model-prepare", {revision: session.revision, ...modelDraft, asr_run_id: modelDraft.asr_enabled ? session.model.asr?.id : null});}
     catch (error) {try {accept(await bridge.apiGet("debug/session", {id: session.id}));} catch {} throw error;}
     modelPreview = prepared; pendingModelRun = null;
     accept(await bridge.apiGet("debug/session", {id: session.id})); renderKey = ""; render();
@@ -385,13 +410,37 @@ function renderModel(parent) {
   } else if (session.model.prepared) {
     parent.append(button("加载已准备的输入预览", () => action(async () => {
       const detail = await bridge.apiGet("debug/model-record", {id: session.id, record: session.model.prepared.id});
-      modelPreview = detail.input; modelDraft = {provider_id: detail.input.provider.id, question: detail.input.question, mode: detail.input.mode}; renderKey = ""; render();
+      modelPreview = detail.input; modelDraft = draftFromInput(detail.input); renderKey = ""; render();
     })));
-    note(parent, "更换模型、问题或图片模式后，请重新预览输入。");
+    note(parent, "更换模型、问题、图片模式或 ASR 输入后，请重新预览。");
   }
   renderModelHistory(parent);
   const actions = node("div", "inline-actions"); actions.append(button("导出全部调试与模型记录 JSON", exportRecord)); parent.append(actions);
 }
+async function startASR() {
+  if (!modelDraft.asr_enabled || !modelDraft.asr_provider_id) throw new Error("请先选择 ASR 提供商。");
+  if (!pendingASRRun || pendingASRRun.provider_id !== modelDraft.asr_provider_id) pendingASRRun = {provider_id: modelDraft.asr_provider_id, run_id: Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("")};
+  const data = await post("model-asr", {revision: session.revision, ...pendingASRRun});
+  pendingASRRun = null; pendingModelRun = null; modelPreview = null; accept(data); renderKey = ""; render();
+}
+function renderASR(parent) {
+  const audio = session.model.asr;
+  if (!audio || audio.provider.id !== modelDraft.asr_provider_id) {note(parent, "当前 ASR 尚未转写，请先点击“转写音轨”。"); return;}
+  stats(parent, [["转写状态", asrStatus(audio.transcription_status || audio.status)], ["转写耗时", time(audio.seconds)], ["转写片段", audio.segment_count + " 段"], ["命中缓存", audio.cache_hit_count + " 段"]]);
+  if (audio.error) note(parent, audio.error, true);
+  if (["queued", "running"].includes(audio.status)) return;
+  const body = node("div"); parent.append(body);
+  if (!modelDetails.has(audio.id)) modelDetails.set(audio.id, bridge.apiGet("debug/model-record", {id: session.id, record: audio.id}));
+  modelDetails.get(audio.id).then(detail => {
+    if (!body.isConnected) return;
+    const result = detail.asr.result;
+    if (!result) return;
+    if (result.message && result.message !== audio.error) note(body, result.message, result.status !== "no_audio");
+    if (result.guidance) note(body, result.guidance);
+    table(body, "语音转写片段", ["起始时间", "结束时间", "转写文本"], (result.segments || []).map(segment => [time(segment.start_sec), time(segment.end_sec), segment.text]));
+  }).catch(error => {modelDetails.delete(audio.id); if (body.isConnected) note(body, error.message || "转写记录加载失败", true);});
+}
+function asrStatus(status) {return {success: "转写完成", no_audio: "没有音轨", partial: "部分完成", timeout: "转写超时", unavailable: "ASR 不可用", failed: "转写失败"}[status] || modelStatus(status);}
 async function startModel() {
   if (!previewMatches()) throw new Error("请先预览当前模型、问题和图片模式的输入。");
   if (!pendingModelRun || pendingModelRun.preview_id !== modelPreview.id) pendingModelRun = {preview_id: modelPreview.id, run_id: Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, "0")).join("")};
@@ -409,15 +458,16 @@ function renderModelHistory(parent) {
   for (const [index, run] of runs.entries()) {
     const label = node("label", "model-run-choice"), checkbox = node("input"); checkbox.type = "checkbox"; checkbox.checked = selectedRuns.includes(run.id);
     checkbox.addEventListener("change", () => {selectedRuns = checkbox.checked ? [...selectedRuns.filter(id => id !== run.id), run.id].slice(-2) : selectedRuns.filter(id => id !== run.id); renderKey = ""; render();});
-    label.append(checkbox, node("span", "", "#" + (index + 1) + " · " + run.input.provider.id + " · " + (run.input.mode === "grid" ? "九宫格" : "独立帧") + " · " + modelStatus(run.status))); list.append(label);
+    label.append(checkbox, node("span", "", "#" + (index + 1) + " · " + run.input.provider.id + " · " + (run.input.mode === "grid" ? "九宫格" : "独立帧") + " · " + (run.input.asr ? "ASR " + run.input.asr.provider.id : "纯画面") + " · " + modelStatus(run.status))); list.append(label);
   }
   parent.append(list);
-  note(parent, "选择最多两条记录并排比较。问题、模型和帧相同时，更适合观察两种图片模式的差别。重跑本地流水线会清空本次调用记录，可先导出保留。");
+  note(parent, "选择最多两条记录并排比较。可保持问题、模型和帧相同，对比图片模式或是否加入语音转写。重跑本地流水线会清空本次调用记录，可先导出保留。");
   const comparison = node("div", "model-comparison"); parent.append(comparison);
   const capture = {id: session.id, revision: session.revision};
   for (const run of runs.filter(item => selectedRuns.includes(item.id))) {
     const card = node("section", "model-result"); comparison.append(card);
     card.append(node("h3", "", run.input.provider.id + " · " + (run.input.mode === "grid" ? "九宫格" : "独立帧")), node("p", "small muted", new Date(run.created_at).toLocaleString("zh-CN", {hour12: false}) + " · " + modelStatus(run.status)));
+    card.append(node("p", "small muted", run.input.asr ? "语音输入：" + run.input.asr.provider.id + " · " + asrStatus(run.input.asr.transcription_status) + " · " + run.input.asr.segment_count + " 段" : "语音输入：未加入（纯画面）"));
     stats(card, [["调用耗时", time(run.seconds)], ["发送图片", run.input.image_count + " 张"], ["输入 token", run.usage?.input ?? "未提供"], ["输出 token", run.usage?.output ?? "未提供"], ["缓存输入 token", run.usage?.input_cached ?? "未提供"], ["总 token", run.usage?.total ?? "未提供"]]);
     card.append(node("p", "model-question", run.input.question));
     if (run.error) note(card, run.error, true);
@@ -548,7 +598,7 @@ async function showGrid(index, kind = "grid") {
     const toggle = button("按原始像素查看", () => {const actual = viewport.classList.toggle("actual-size"); toggle.textContent = actual ? "适应窗口" : "按原始像素查看";});
     const actions = node("div", "inline-actions"); actions.append(toggle); content.append(actions, viewport);
     note(content, data.image.width + " × " + data.image.height + " · " + bytes(data.image.bytes) + "。切换为原始像素后，可滚动查看细节。");
-    table(content, "帧与格子对应关系", ["帧编号", "行 / 列", "实际时间", "单帧尺寸", "frame_id"], data.image.cells.map(cell => ["#" + cell.frame_number, (cell.row || 1) + " / " + (cell.column || 1), time(cell.timestamp_sec), (cell.width || data.image.width) + "×" + (cell.height || data.image.height), cell.frame_id]));
+    table(content, "帧与格子对应关系", ["帧编号", "行 / 列", "实际时间", "单帧尺寸", "frame_id"], data.image.cells.map(cell => ["#" + cell.frame_number, (cell.row || 1) + " / " + (cell.column || 1), time(cell.timestamp_sec), (cell.width ?? data.image.frame_width ?? data.image.width) + "×" + (cell.height ?? data.image.frame_height ?? data.image.height), cell.frame_id]));
   } catch (error) {if (version === dialogVersion) content.replaceChildren(node("p", "", error.message || "拼图加载失败"));}
 }
 async function showFrame(kind, index, variant) {

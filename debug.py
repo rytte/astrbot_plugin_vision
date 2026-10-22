@@ -302,7 +302,10 @@ class DebugSessions:
     async def cancel(self, session: DebugSession) -> None:
         async with session.lock:
             self._active(session)
-            running = session.task is not None and session.operation != "model"
+            running = session.task is not None and session.operation not in {
+                "model",
+                "asr",
+            }
             await self._stop(session)
             if running:
                 session.error = "已取消当前阶段，可以重试或调参重跑"

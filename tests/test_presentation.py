@@ -22,10 +22,12 @@ def media(tmp_path):
     )
 
 
-def make_frames(media, count):
+def make_frames(media, count, uniform=False):
     frames = []
     for index in range(count):
-        width, height = 64 + index % 3 * 11, 48 + index % 2 * 7
+        width, height = (
+            (64, 48) if uniform else (64 + index % 3 * 11, 48 + index % 2 * 7)
+        )
         path = media.cache_dir / f"frame_{index}.jpg"
         with Image.new("RGB", (width, height)) as image:
             image.putdata(
@@ -53,8 +55,9 @@ def make_frames(media, count):
 
 
 @pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5, 8, 9, 10, 18, 19])
-async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count):
-    frames = make_frames(media, count)
+@pytest.mark.parametrize("uniform", [False, True])
+async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count, uniform):
+    frames = make_frames(media, count, uniform)
     images = await present_frames(media, frames)
     assert len(images) == (count + 8) // 9
     cells = []
@@ -64,6 +67,24 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count):
         assert [(cell["row"], cell["column"]) for cell in output.cells] == sorted(
             (cell["row"], cell["column"]) for cell in output.cells
         )
+        metadata = output.metadata()
+        sizes = {
+            (
+                frames[cell["frame_number"] - 1].width,
+                frames[cell["frame_number"] - 1].height,
+            )
+            for cell in output.cells
+        }
+        if len(sizes) == 1:
+            assert (metadata["frame_width"], metadata["frame_height"]) == next(
+                iter(sizes)
+            )
+            assert all(
+                "width" not in cell and "height" not in cell for cell in output.cells
+            )
+        else:
+            assert "frame_width" not in metadata and "frame_height" not in metadata
+            assert all("width" in cell and "height" in cell for cell in output.cells)
         with Image.open(output.path) as grid:
             assert grid.format == "PNG"
             assert grid.size == (output.width, output.height)
@@ -77,6 +98,8 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count):
                 assert cell["requested_sec"] == frame.requested_sec
                 assert cell["frame_id"] == frame.frame_id
                 assert "x" not in cell and "y" not in cell
+                assert cell.get("width", metadata.get("frame_width")) == frame.width
+                assert cell.get("height", metadata.get("frame_height")) == frame.height
                 x = GUTTER + (cell["column"] - 1) * (cell_width + GUTTER)
                 y = GUTTER + (cell["row"] - 1) * (cell_height + GUTTER) + LABEL_HEIGHT
                 crop = grid.crop(

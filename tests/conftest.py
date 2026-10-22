@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -59,6 +60,9 @@ def asr_provider():
         "key": ["private-key"],
     }
     provider.get_model.return_value = "test-speech-model"
+    provider.meta.return_value = SimpleNamespace(
+        id="test-asr", model="test-speech-model"
+    )
     provider.get_text = AsyncMock(return_value="测试语音转写：请观察画面。")
     return provider
 

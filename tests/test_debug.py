@@ -105,13 +105,20 @@ async def test_grid_debug_output_preview_metadata_and_reset(sessions, sample_vid
     assert snapshot["parameters"]["overview_output_mode"] == "grid"
     assert presentation["image_count"] < presentation["frame_count"]
     assert all(
-        "x" not in cell and "y" not in cell
+        (image["frame_width"], image["frame_height"])
+        == (session.pipeline.kept[0].width, session.pipeline.kept[0].height)
+        for image in presentation["images"]
+    )
+    assert all(
+        not {"x", "y", "width", "height"}.intersection(cell)
         for image in presentation["images"]
         for cell in image["cells"]
     )
     assert snapshot["result"]["output_image_bytes"] == presentation["total_bytes"]
     preview = await sessions.image(session, "grid", 0, "full", session.revision)
     assert preview["image"]["cells"] == presentation["images"][0]["cells"]
+    assert preview["image"]["frame_width"] == presentation["images"][0]["frame_width"]
+    assert preview["image"]["frame_height"] == presentation["images"][0]["frame_height"]
     assert preview["data_url"].startswith("data:image/png;base64,")
     with Image.open(
         io.BytesIO(base64.b64decode(preview["data_url"].split(",")[1]))

@@ -26,14 +26,18 @@ class OutputImage:
     width: int
     height: int
     cells: list[dict]
+    frame_size: tuple[int, int] | None = None
 
     def metadata(self) -> dict:
-        return {
+        data = {
             "width": self.width,
             "height": self.height,
             "mime_type": self.mime_type,
-            "cells": self.cells,
         }
+        if self.frame_size is not None:
+            data["frame_width"], data["frame_height"] = self.frame_size
+        data["cells"] = self.cells
+        return data
 
 
 def presentation_metadata(mode: str, images: list[OutputImage]) -> dict:
@@ -90,7 +94,12 @@ def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:
     signature = json.dumps(["grid-v1", width, height, cells], sort_keys=True)
     token = hashlib.sha256(signature.encode()).hexdigest()
     target = media.cache_dir / f"grid_{token}.png"
-    result = OutputImage(target, "image/png", width, height, cells)
+    sizes = {(frame.width, frame.height) for frame in frames}
+    frame_size = next(iter(sizes)) if len(sizes) == 1 else None
+    if frame_size is not None:
+        for cell in cells:
+            del cell["width"], cell["height"]
+    result = OutputImage(target, "image/png", width, height, cells, frame_size)
     if target.is_file():
         target.touch()
         return result
@@ -103,7 +112,7 @@ def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:
                 x = GUTTER + (cell["column"] - 1) * (cell_width + GUTTER)
                 y = GUTTER + (cell["row"] - 1) * (cell_height + GUTTER) + LABEL_HEIGHT
                 with Image.open(frame.path) as source:
-                    if source.size != (cell["width"], cell["height"]):
+                    if source.size != (frame.width, frame.height):
                         raise VideoError("抽帧图片尺寸已变化，请重新运行概览")
                     canvas.paste(source, (x, y))
                 draw.text(

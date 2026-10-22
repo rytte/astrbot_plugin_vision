@@ -32,6 +32,7 @@ class DebugWeb:
             "model-records": "GET",
             "model-prepare": "POST",
             "model-run": "POST",
+            "model-asr": "POST",
             "page-state": "POST",
             "upload/<csrf_token>": "POST",
             "next": "POST",
@@ -114,6 +115,9 @@ class DebugWeb:
                     "ttl_seconds": self.sessions.ttl,
                     "providers": self.sessions.models.providers(self.context),
                     "default_provider_id": self.sessions.media.settings.overview_provider_id,
+                    "asr_providers": self.sessions.models.asr_providers(self.context),
+                    "asr_enabled": self.sessions.media.settings.asr_enabled,
+                    "asr_provider_id": self.sessions.media.settings.asr_provider_id,
                     "active_session_id": self.sessions.active_session(owner),
                     "sessions": [
                         {"id": session.id, "filename": session.filename}
@@ -135,6 +139,7 @@ class DebugWeb:
                         if session.model.prepared
                         else None,
                         "runs": [run.detail() for run in session.model.runs],
+                        "asr_runs": [run.detail() for run in session.model.asr_runs],
                     }
                 else:
                     try:
@@ -194,6 +199,9 @@ class DebugWeb:
                         body.get("provider_id"),
                         body.get("question"),
                         body.get("mode"),
+                        asr_enabled=body.get("asr_enabled", False),
+                        asr_provider_id=body.get("asr_provider_id", ""),
+                        asr_run_id=body.get("asr_run_id"),
                     )
                     return json_response(
                         {"status": "ok", "data": data},
@@ -205,6 +213,14 @@ class DebugWeb:
                         self.context,
                         body.get("revision"),
                         body.get("preview_id"),
+                        body.get("run_id"),
+                    )
+                elif action == "model-asr":
+                    await self.sessions.models.start_asr(
+                        session,
+                        self.context,
+                        body.get("revision"),
+                        body.get("provider_id"),
                         body.get("run_id"),
                     )
                 else:

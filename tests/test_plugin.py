@@ -562,6 +562,11 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         if expected_mode == "grid"
         else descriptions
     )
+    if expected_mode == "grid":
+        assert all(
+            "frame_width" in image and "frame_height" in image for image in descriptions
+        )
+        assert all("width" not in cell and "height" not in cell for cell in frames)
     assert len(frames) == metadata["new_frame_count"] > 0
     assert all("x" not in frame and "y" not in frame for frame in frames)
     assert [frame["timestamp_sec"] for frame in frames] == sorted(
@@ -1318,7 +1323,11 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     prompt = json.loads(call["prompt"].split("\n", 1)[1])
     assert prompt["presentation"] == overview["presentation"]
     assert all(
-        "x" not in cell and "y" not in cell
+        "frame_width" in image and "frame_height" in image
+        for image in prompt["presentation"]["images"]
+    )
+    assert all(
+        not {"x", "y", "width", "height"}.intersection(cell)
         for image in prompt["presentation"]["images"]
         for cell in image["cells"]
     )
