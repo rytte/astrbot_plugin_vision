@@ -6,7 +6,12 @@ from dataclasses import replace
 import pytest
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.media import FFmpegMedia, Frame, VideoError
-from astrbot_plugin_vision.presentation import present_frames, presentation_metadata
+from astrbot_plugin_vision.presentation import (
+    GUTTER,
+    LABEL_HEIGHT,
+    present_frames,
+    presentation_metadata,
+)
 from PIL import Image
 
 
@@ -62,18 +67,24 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count):
         with Image.open(output.path) as grid:
             assert grid.format == "PNG"
             assert grid.size == (output.width, output.height)
+            columns = max(cell["column"] for cell in output.cells)
+            rows = max(cell["row"] for cell in output.cells)
+            cell_width = (grid.width - (columns + 1) * GUTTER) // columns
+            cell_height = (grid.height - (rows + 1) * GUTTER) // rows
             for cell in output.cells:
                 frame = frames[cell["frame_number"] - 1]
                 assert cell["timestamp_sec"] == frame.timestamp_sec
                 assert cell["requested_sec"] == frame.requested_sec
                 assert cell["frame_id"] == frame.frame_id
-                assert cell["y"] >= 32
+                assert "x" not in cell and "y" not in cell
+                x = GUTTER + (cell["column"] - 1) * (cell_width + GUTTER)
+                y = GUTTER + (cell["row"] - 1) * (cell_height + GUTTER) + LABEL_HEIGHT
                 crop = grid.crop(
                     (
-                        cell["x"],
-                        cell["y"],
-                        cell["x"] + frame.width,
-                        cell["y"] + frame.height,
+                        x,
+                        y,
+                        x + frame.width,
+                        y + frame.height,
                     )
                 )
                 with Image.open(frame.path) as source:

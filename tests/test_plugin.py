@@ -16,6 +16,7 @@ from astrbot.core.agent.message import (
     AssistantMessageSegment,
     ImageURLPart,
     Message,
+    TextPart,
     ToolCallMessageSegment,
 )
 from astrbot.core.agent.run_context import ContextWrapper
@@ -123,6 +124,14 @@ def image_parts(event):
         for message in event.agent_context.messages
         if isinstance(message.content, list)
         for part in message.content
+        if isinstance(part, ImageURLPart)
+    ]
+
+
+def image_metadata(message):
+    return [
+        json.loads(message.content[index - 1].text)
+        for index, part in enumerate(message.content)
         if isinstance(part, ImageURLPart)
     ]
 
@@ -331,18 +340,21 @@ async def test_missing_agent_context_fails_before_extracting_frames(
 
 
 @pytest.mark.parametrize(
-    "tool_name,mode,invalid_first",
+    "tool_name,mode,invalid_first,output_mode",
     [
-        ("video_overview", None, False),
-        ("video_inspect", "range", False),
-        ("video_inspect", "timestamps", False),
-        ("video_inspect", "timestamps", True),
+        ("video_overview", None, False, "frames"),
+        ("video_overview", None, False, "grid"),
+        ("video_inspect", "range", False, "frames"),
+        ("video_inspect", "timestamps", False, "grid"),
+        ("video_inspect", "timestamps", True, "frames"),
     ],
 )
 async def test_real_agent_loop_receives_images_without_generic_send_prompt(
-    plugin, sample_video, tool_name, mode, invalid_first
+    plugin, sample_video, tool_name, mode, invalid_first, output_mode
 ):
-    event = Event(admin=True, agent=False)
+    if output_mode == "grid":
+        enable_grid(plugin)
+    event = Event(admin=True, agent=False, messages=[Video(file=str(sample_video))])
     arguments = {"video_path": str(sample_video)}
     if tool_name == "video_inspect":
         arguments.update(mode=mode, times_sec=[0, 1], max_frames=None, max_edge=None)
@@ -380,9 +392,11 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
 
     context = ContextWrapper(context=SimpleNamespace(event=event))
     runner = ToolLoopAgentRunner()
+    request = ProviderRequest(prompt="视频里发生了什么？", func_tool=ToolSet([tool]))
+    await plugin.prepare_video_resources(event, request)
     await runner.reset(
         provider=provider,
-        request=ProviderRequest(prompt="视频里发生了什么？", func_tool=ToolSet([tool])),
+        request=request,
         run_context=context,
         tool_executor=FunctionToolExecutor(),
         agent_hooks=PluginAgentHooks(plugin, event),
@@ -417,19 +431,43 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     assert messages[image_index - 1].tool_call_id == "call_video"
     assert messages[0].role == "user"
     assert all(part.type == "text" for part in messages[0].content)
-    assert "".join(part.text for part in messages[0].content) == "视频里发生了什么？"
+    assert request.prompt == "视频里发生了什么？"
+    assert [part.text for part in messages[0].content] == [
+        request.prompt,
+        request.extra_user_content_parts[0].text,
+    ]
+    resources = json.loads(messages[0].content[1].text.split("\n")[1])
+    assert resources == {"video_paths": [str(sample_video)], "errors": []}
     assert type(context.messages) is list
     parts = image_message.content
+    assert json.loads(parts[0].text) == {
+        "tool": tool_name,
+        "video_path": str(sample_video),
+    }
     images = [part for part in parts if part.type == "image_url"]
-    assert len(images) == metadata["new_frame_count"] > 0
-    assert [json.loads(part.text) for part in parts if part.type == "text"] == metadata[
-        "frames"
-    ]
+    assert len(images) == metadata["submitted_image_count"] > 0
+    assert [part.type for part in parts[1:]] == ["text", "image_url"] * len(images)
+    descriptions = image_metadata(image_message)
+    expected_mode = output_mode if tool_name == "video_overview" else "frames"
+    assert metadata["presentation"]["mode"] == expected_mode
+    frames = (
+        [cell for description in descriptions for cell in description["cells"]]
+        if expected_mode == "grid"
+        else descriptions
+    )
+    assert len(frames) == metadata["new_frame_count"] > 0
+    assert all("x" not in frame and "y" not in frame for frame in frames)
+    assert [frame["timestamp_sec"] for frame in frames] == sorted(
+        frame["timestamp_sec"] for frame in frames
+    )
+    assert "frames" not in metadata
+    assert "images" not in metadata["presentation"]
     for image in images:
         assert base64.b64decode(
             image.image_url.url.split(",", 1)[1]
         ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     serialized = json.dumps([message.model_dump() for message in messages])
+    assert all(serialized.count(frame["frame_id"]) == 1 for frame in frames)
     assert "Image returned and cached" not in serialized
     assert "Review the image below" not in serialized
     assert "send_message_to_user" not in serialized
@@ -453,14 +491,22 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         "assistant",
     ]
     assert history[image_index - 1]["tool_call_id"] == "call_video"
+    assert history[0]["content"] == messages[0].model_dump()["content"]
     assert history[image_index]["content"] == image_message.model_dump()["content"]
+    saved = json.dumps(history)
+    assert all(saved.count(frame["frame_id"]) == 1 for frame in frames)
 
 
 @pytest.mark.parametrize("batch_size", [1, 2])
 async def test_real_agent_loop_orders_images_across_batches_and_context_rebuilds(
-    plugin, sample_video, batch_size
+    plugin, sample_video, batch_size, tmp_path
 ):
     plugin.settings = replace(plugin.settings, inspect_max_calls=4)
+    video_paths = [sample_video]
+    if batch_size == 2:
+        other_video = tmp_path / "other video.mp4"
+        other_video.write_bytes(sample_video.read_bytes())
+        video_paths.append(other_video)
     event = Event(admin=True, agent=False)
     responses = [
         LLMResponse(
@@ -468,7 +514,7 @@ async def test_real_agent_loop_orders_images_across_batches_and_context_rebuilds
             tools_call_name=["video_inspect"] * batch_size,
             tools_call_args=[
                 {
-                    "video_path": str(sample_video),
+                    "video_path": str(video_paths[index]),
                     "mode": "timestamps",
                     "times_sec": [(round_index * batch_size + index) * 0.8],
                     "max_frames": None,
@@ -518,12 +564,19 @@ async def test_real_agent_loop_orders_images_across_batches_and_context_rebuilds
         assert [message.tool_call_id for message in results] == [
             f"call_{round_index}_{index}" for index in range(batch_size)
         ]
-        for result, picture in zip(results, pictures):
+        for index, (result, picture) in enumerate(zip(results, pictures)):
             metadata = json.loads(result.content)
             assert metadata["success"]
-            assert [
-                json.loads(part.text) for part in picture.content if part.type == "text"
-            ] == metadata["frames"]
+            assert json.loads(picture.content[0].text) == {
+                "tool": "video_inspect",
+                "video_path": metadata["video_path"],
+            }
+            assert "frames" not in metadata
+            assert "images" not in metadata["presentation"]
+            frames = image_metadata(picture)
+            assert len(frames) == metadata["new_frame_count"] == 1
+            requested = responses[round_index].tools_call_args[index]["times_sec"][0]
+            assert frames[0]["requested_sec"] == pytest.approx(requested)
             assert sum(part.type == "image_url" for part in picture.content) == 1
         offset += 1 + 2 * batch_size
     assert [message.role for message in messages] == [*expected_roles, "assistant"]
@@ -615,21 +668,49 @@ async def test_aborted_tool_batch_discards_unrecorded_images(plugin, sample_vide
     )
 
 
-async def test_video_attachment_is_exposed_and_authorized(plugin, sample_video):
+@pytest.mark.parametrize("prompt", ["视频里发生了什么？", "", None])
+async def test_video_attachment_is_exposed_and_authorized(plugin, sample_video, prompt):
     event = Event(messages=[Video(file=str(sample_video))])
-    request = SimpleNamespace(prompt="视频里发生了什么？")
+    existing_part = TextPart(text="其他插件附加的文本")
+    request = ProviderRequest(prompt=prompt, extra_user_content_parts=[existing_part])
     await plugin.prepare_video_resources(event, request)
-    assert json.dumps(str(sample_video), ensure_ascii=False) in request.prompt
+    assert request.prompt == prompt
+    assert len(request.extra_user_content_parts) == 2
+    assert request.extra_user_content_parts[0] is existing_part
+    resource_part = request.extra_user_content_parts[1]
+    assert isinstance(resource_part, TextPart)
+    assert resource_part.text.startswith("[视频理解资源]\n")
+    assert json.loads(resource_part.text.split("\n")[1]) == {
+        "video_paths": [str(sample_video)],
+        "errors": [],
+    }
     assert plugin._authorize(event, str(sample_video)) == sample_video
-    first = request.prompt
     await plugin.prepare_video_resources(event, request)
-    assert request.prompt == first
-    assert plugin._state(event)["question"] == "视频里发生了什么？"
+    assert request.prompt == prompt
+    assert request.extra_user_content_parts == [existing_part, resource_part]
+    assert plugin._state(event)["question"] == (prompt or "")
+
+
+async def test_unreadable_video_error_is_added_as_separate_text(
+    plugin, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        Video, "convert_to_file_path", AsyncMock(side_effect=FileNotFoundError)
+    )
+    event = Event(messages=[Video(file=str(tmp_path / "missing.mp4"))])
+    request = ProviderRequest(prompt="这个视频是什么内容？")
+    await plugin.prepare_video_resources(event, request)
+    assert request.prompt == "这个视频是什么内容？"
+    assert len(request.extra_user_content_parts) == 1
+    resources = json.loads(request.extra_user_content_parts[0].text.split("\n")[1])
+    assert resources["video_paths"] == []
+    assert len(resources["errors"]) == 1
+    assert not plugin._state(event)["attachment_paths"]
 
 
 async def test_cached_video_is_not_repeated_in_later_prompts(plugin, sample_video):
     attachment = Event(messages=[Video(file=str(sample_video))])
-    await plugin.prepare_video_resources(attachment, SimpleNamespace(prompt="看看视频"))
+    await plugin.prepare_video_resources(attachment, ProviderRequest(prompt="看看视频"))
 
     for prompt in (
         "两分钟后发下今日小猪",
@@ -641,9 +722,10 @@ async def test_cached_video_is_not_repeated_in_later_prompts(plugin, sample_vide
         "那段视频的开头说了什么",
     ):
         event = Event()
-        request = SimpleNamespace(prompt=prompt)
+        request = ProviderRequest(prompt=prompt)
         await plugin.prepare_video_resources(event, request)
         assert request.prompt == prompt
+        assert request.extra_user_content_parts == []
         assert not plugin._state(event)["attachment_paths"]
         assert plugin._authorize(event, str(sample_video)) == sample_video
 
@@ -655,16 +737,17 @@ async def test_cached_video_is_not_repeated_in_later_prompts(plugin, sample_vide
 
 async def test_new_video_prompt_does_not_include_cached_old_video(plugin, sample_video):
     old_event = Event(messages=[Video(file=str(sample_video))])
-    await plugin.prepare_video_resources(old_event, SimpleNamespace(prompt="旧视频"))
+    await plugin.prepare_video_resources(old_event, ProviderRequest(prompt="旧视频"))
     new_video = sample_video.with_name("new video.mp4")
     await asyncio.to_thread(
         new_video.write_bytes, await asyncio.to_thread(sample_video.read_bytes)
     )
 
     event = Event(messages=[Video(file=str(new_video))])
-    request = SimpleNamespace(prompt="新视频")
+    request = ProviderRequest(prompt="新视频")
     await plugin.prepare_video_resources(event, request)
-    resources = json.loads(request.prompt.split("\n")[3])
+    assert request.prompt == "新视频"
+    resources = json.loads(request.extra_user_content_parts[0].text.split("\n")[1])
     assert resources["video_paths"] == [str(new_video)]
     assert plugin._authorize(event, str(sample_video)) == sample_video
     assert plugin._authorize(event, str(new_video)) == new_video
@@ -672,9 +755,11 @@ async def test_new_video_prompt_does_not_include_cached_old_video(plugin, sample
 
 async def test_quoted_video_attachment_is_supported(plugin, sample_video):
     event = Event(messages=[Reply(id="1", chain=[Video(file=str(sample_video))])])
-    request = SimpleNamespace(prompt="回看这个视频")
+    request = ProviderRequest(prompt="回看这个视频")
     await plugin.prepare_video_resources(event, request)
-    assert json.dumps(str(sample_video), ensure_ascii=False) in request.prompt
+    assert request.prompt == "回看这个视频"
+    resources = json.loads(request.extra_user_content_parts[0].text.split("\n")[1])
+    assert resources["video_paths"] == [str(sample_video)]
 
 
 async def test_early_hook_materializes_video_once(plugin, sample_video, monkeypatch):
@@ -692,7 +777,7 @@ async def test_early_hook_materializes_video_once(plugin, sample_video, monkeypa
     event = Event(messages=[video])
     await plugin.capture_video_attachments(event)
     assert await video.convert_to_file_path() == str(sample_video)
-    await plugin.prepare_video_resources(event, SimpleNamespace(prompt=""))
+    await plugin.prepare_video_resources(event, ProviderRequest(prompt=""))
     assert len(downloads) == 1
 
 
@@ -712,11 +797,11 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
         assert base64.b64decode(
             image.image_url.url.split(",", 1)[1]
         ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
-    assert [
-        json.loads(part.text)
-        for part in event.agent_context.messages[-1].content
-        if part.type == "text"
-    ] == data(result)["frames"]
+    descriptions = image_metadata(event.agent_context.messages[-1])
+    assert len(descriptions) == len(images)
+    assert {frame["frame_id"] for frame in descriptions} == plugin._state(event)["seen"]
+    assert "frames" not in data(result)
+    assert "images" not in data(result)["presentation"]
     assert data(result)["sampling"]["requested_interval_sec"] == 4
     assert data(result)["sampling"]["budget_frames"] == 200
     assert data(result)["overview_mode"] == "direct"
@@ -733,6 +818,23 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     record_tool_result(event, "video_inspect", inspect)
     assert len(image_parts(event)) == len(images) + data(inspect)["new_frame_count"]
 
+    message_count = len(event.agent_context.messages)
+    image_count = len(image_parts(event))
+    repeated = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[0.5], max_edge=128
+    )
+    assert not repeated.isError
+    summary = data(repeated)
+    assert summary["new_frame_count"] == summary["submitted_image_count"] == 0
+    assert summary["skipped_already_seen_count"] == data(inspect)["new_frame_count"]
+    assert summary["remaining_inspect_calls"] == 1
+    assert "frames" not in summary
+    assert "images" not in summary["presentation"]
+    record_tool_result(event, "video_inspect", repeated)
+    assert len(event.agent_context.messages) == message_count + 2
+    assert event.agent_context.messages[-1].role == "tool"
+    assert len(image_parts(event)) == image_count
+
 
 async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     delegated_plugin, sample_video
@@ -740,7 +842,7 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     plugin = delegated_plugin
     event = Event(messages=[Video(file=str(sample_video))])
     question = "请观察画面颜色的变化"
-    await plugin.prepare_video_resources(event, SimpleNamespace(prompt=question))
+    await plugin.prepare_video_resources(event, ProviderRequest(prompt=question))
     result = await plugin.video_overview(event, str(sample_video))
     assert not result.isError
     assert all(content.type == "text" for content in result.content)
@@ -771,7 +873,10 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert all(content.type == "text" for content in inspected.content)
     record_tool_result(event, "video_inspect", inspected)
     assert len(image_parts(event)) == data(inspected)["new_frame_count"] > 0
-    assert data(inspected)["frames"][0]["frame_id"] == overview["frames"][0]["frame_id"]
+    assert (
+        image_metadata(event.agent_context.messages[-1])[0]["frame_id"]
+        == overview["frames"][0]["frame_id"]
+    )
     plugin.context.llm_generate.assert_awaited_once()
 
 
@@ -895,7 +1000,7 @@ async def test_cancellation_stops_delegated_model(
 
 async def test_other_user_and_other_chat_cannot_access_attachment(plugin, sample_video):
     event = Event(messages=[Video(file=str(sample_video))])
-    await plugin.prepare_video_resources(event, SimpleNamespace(prompt=""))
+    await plugin.prepare_video_resources(event, ProviderRequest(prompt=""))
     for outsider in (Event(user="bob"), Event(origin="other-chat")):
         result = await plugin.video_overview(outsider, str(sample_video))
         assert result.isError
@@ -1039,12 +1144,11 @@ async def test_grid_overview_sends_pngs_and_keeps_inspect_independent(
     assert all(
         image.image_url.url.startswith("data:image/png;base64,") for image in images
     )
-    cells = [
-        cell for image in overview["presentation"]["images"] for cell in image["cells"]
-    ]
-    assert [cell["frame_id"] for cell in cells] == [
-        frame["frame_id"] for frame in overview["frames"]
-    ]
+    descriptions = image_metadata(event.agent_context.messages[-1])
+    cells = [cell for image in descriptions for cell in image["cells"]]
+    assert len(cells) == overview["new_frame_count"]
+    assert "frames" not in overview
+    assert "images" not in overview["presentation"]
     assert plugin._state(event)["seen"] == {frame["frame_id"] for frame in cells}
     inspected = await plugin.video_inspect(
         event, str(sample_video), mode="timestamps", times_sec=[0], max_edge=256
@@ -1065,13 +1169,16 @@ async def test_grid_omits_already_seen_frames_and_updates_cell_numbers(
     )
     assert not inspected.isError
     record_tool_result(event, "video_inspect", inspected)
-    seen = data(inspected)["frames"][0]["frame_id"]
+    seen = image_metadata(event.agent_context.messages[-1])[0]["frame_id"]
     result = await plugin.video_overview(event, str(sample_video))
     assert not result.isError
     overview = data(result)
-    assert [frame["frame_id"] for frame in overview["skipped_already_seen"]] == [seen]
+    assert overview["skipped_already_seen_count"] == 1
+    record_tool_result(event, "video_overview", result)
     cells = [
-        cell for image in overview["presentation"]["images"] for cell in image["cells"]
+        cell
+        for image in image_metadata(event.agent_context.messages[-1])
+        for cell in image["cells"]
     ]
     assert seen not in {cell["frame_id"] for cell in cells}
     assert [cell["frame_number"] for cell in cells] == list(range(1, len(cells) + 1))
@@ -1094,6 +1201,11 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     assert all(Path(path).suffix == ".png" for path in call["image_urls"])
     prompt = json.loads(call["prompt"].split("\n", 1)[1])
     assert prompt["presentation"] == overview["presentation"]
+    assert all(
+        "x" not in cell and "y" not in cell
+        for image in prompt["presentation"]["images"]
+        for cell in image["cells"]
+    )
     assert "从左到右" in call["prompt"]
     assert not image_parts(event)
     assert not plugin._state(event)["seen"]

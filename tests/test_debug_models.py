@@ -108,7 +108,13 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
         assert "private-key" not in json.dumps(prepared)
         payload = json.loads(prepared["prompt"].split("\n", 1)[1])
         assert [frame["frame_id"] for frame in payload["frames"]] == original_ids
+        assert all(
+            "x" not in cell and "y" not in cell
+            for image in payload["presentation"]["images"]
+            for cell in image["cells"]
+        )
         image = await sessions.image(session, "model", 0, "full", 0, prepared["id"])
+        assert image["image"]["cells"] == payload["presentation"]["images"][0]["cells"]
         assert (
             base64.b64decode(image["data_url"].split(",")[1])
             == shared.images[0].path.read_bytes()

@@ -83,8 +83,6 @@ def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:
                 "frame_number": offset + index + 1,
                 "row": row + 1,
                 "column": column + 1,
-                "x": GUTTER + column * (cell_width + GUTTER),
-                "y": GUTTER + row * (cell_height + GUTTER) + LABEL_HEIGHT,
                 "width": frame.width,
                 "height": frame.height,
             }
@@ -101,12 +99,15 @@ def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:
         with Image.new("RGB", (width, height), "#18202d") as canvas:
             draw = ImageDraw.Draw(canvas)
             for frame, cell, label in zip(frames, cells, labels):
+                # 像素坐标仅用于绘图，不放入对外的格子元数据。
+                x = GUTTER + (cell["column"] - 1) * (cell_width + GUTTER)
+                y = GUTTER + (cell["row"] - 1) * (cell_height + GUTTER) + LABEL_HEIGHT
                 with Image.open(frame.path) as source:
                     if source.size != (cell["width"], cell["height"]):
                         raise VideoError("抽帧图片尺寸已变化，请重新运行概览")
-                    canvas.paste(source, (cell["x"], cell["y"]))
+                    canvas.paste(source, (x, y))
                 draw.text(
-                    (cell["x"] + 6, cell["y"] - LABEL_HEIGHT + 6),
+                    (x + 6, y - LABEL_HEIGHT + 6),
                     label,
                     font=font,
                     fill="white",
