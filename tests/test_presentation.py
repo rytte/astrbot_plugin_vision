@@ -95,7 +95,7 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count, u
             for cell in output.cells:
                 frame = frames[cell["frame_number"] - 1]
                 assert cell["timestamp_sec"] == frame.timestamp_sec
-                assert cell["requested_sec"] == frame.requested_sec
+                assert "requested_sec" not in cell
                 assert cell["frame_id"] == frame.frame_id
                 assert "x" not in cell and "y" not in cell
                 assert cell.get("width", metadata.get("frame_width")) == frame.width
@@ -123,6 +123,7 @@ async def test_independent_mode_returns_original_jpegs(media):
     images = await present_frames(media, frames, mode="frames")
     assert [image.path for image in images] == [frame.path for frame in frames]
     assert all(image.mime_type == "image/jpeg" for image in images)
+    assert all("requested_sec" not in image.cells[0] for image in images)
 
 
 async def test_grid_cache_reuses_same_labels_but_changes_with_frame_order(

@@ -108,7 +108,11 @@ def plugin(tmp_path, monkeypatch):
 
 @pytest.fixture
 def delegated_plugin(plugin):
-    plugin.settings = replace(plugin.settings, overview_provider_id="configured-vision")
+    plugin.settings = replace(
+        plugin.settings,
+        overview_model_enabled=True,
+        overview_provider_id="configured-vision",
+    )
     plugin.context.llm_generate.return_value = SimpleNamespace(
         role="assistant", completion_text="0 秒（首帧）：红色画面。"
     )
@@ -167,6 +171,11 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert Settings.from_mapping(config) == Settings()
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""
+    assert schema["overview_model_enabled"]["type"] == "bool"
+    assert schema["overview_model_enabled"]["default"] is False
+    assert schema["overview_provider_id"]["condition"] == {
+        "overview_model_enabled": True
+    }
     assert schema["asr_enabled"]["type"] == "bool"
     assert schema["asr_enabled"]["default"] is False
     assert schema["asr_provider_id"]["_special"] == "select_provider_stt"
@@ -181,6 +190,7 @@ async def test_asr_enriches_overview_and_deduplicates_inspect(
         plugin.settings,
         asr_enabled=True,
         asr_provider_id="test-asr",
+        overview_model_enabled=delegated,
         overview_provider_id="configured-vision" if delegated else "",
     )
     plugin.context.get_provider_by_id.return_value = asr_provider
@@ -569,6 +579,7 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
         assert all("width" not in cell and "height" not in cell for cell in frames)
     assert len(frames) == metadata["new_frame_count"] > 0
     assert all("x" not in frame and "y" not in frame for frame in frames)
+    assert all("requested_sec" not in frame for frame in frames)
     assert [frame["timestamp_sec"] for frame in frames] == sorted(
         frame["timestamp_sec"] for frame in frames
     )
@@ -697,7 +708,8 @@ async def test_real_agent_loop_orders_images_across_batches_and_context_rebuilds
             frames = image_metadata(picture)
             assert len(frames) == metadata["new_frame_count"] == 1
             requested = responses[round_index].tools_call_args[index]["times_sec"][0]
-            assert frames[0]["requested_sec"] == pytest.approx(requested)
+            assert frames[0]["timestamp_sec"] == pytest.approx(requested)
+            assert "requested_sec" not in frames[0]
             assert sum(part.type == "image_url" for part in picture.content) == 1
         offset += 1 + 2 * batch_size
     assert [message.role for message in messages] == [*expected_roles, "assistant"]
@@ -957,6 +969,40 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
     assert len(image_parts(event)) == image_count
 
 
+@pytest.mark.parametrize("mode", ["frames", "grid"])
+@pytest.mark.parametrize("enabled,selected", [(False, True), (True, False)])
+async def test_overview_switch_and_selection_control_delegation(
+    delegated_plugin, sample_video, mode, enabled, selected
+):
+    plugin = delegated_plugin
+    plugin.settings = replace(
+        plugin.settings,
+        overview_model_enabled=enabled,
+        overview_provider_id="configured-vision" if selected else "",
+        overview_output_mode=mode,
+    )
+    event = Event(admin=True)
+    result = await plugin.video_overview(event, str(sample_video))
+    assert not result.isError
+    assert data(result)["overview_mode"] == "direct"
+    plugin.context.llm_generate.assert_not_awaited()
+    record_tool_result(event, "video_overview", result)
+    assert image_parts(event)
+    assert "requested_sec" not in json.dumps(
+        [message.model_dump() for message in event.agent_context.messages]
+    )
+    if not enabled:
+        # 关闭后保留模型选择，再开启即可继续使用。
+        assert plugin.settings.overview_provider_id == "configured-vision"
+        plugin.settings = replace(plugin.settings, overview_model_enabled=True)
+        delegated = await plugin.video_overview(
+            Event(admin=True, agent=False), str(sample_video)
+        )
+        assert not delegated.isError
+        assert data(delegated)["overview_mode"] == "delegated"
+        plugin.context.llm_generate.assert_awaited_once()
+
+
 async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     delegated_plugin, sample_video
 ):
@@ -969,6 +1015,7 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert all(content.type == "text" for content in result.content)
     overview = data(result)
     assert overview["overview_mode"] == "delegated"
+    assert "requested_sec" not in json.dumps(overview)
     assert overview["overview_provider_id"] == "configured-vision"
     assert overview["overview_text"] == "0 秒（首帧）：红色画面。"
     assert overview["new_frame_count"] == 0
@@ -981,6 +1028,7 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     for path in call["image_urls"]:
         assert await asyncio.to_thread(Path(path).is_file)
     prompt_data = json.loads(call["prompt"].split("\n", 1)[1])
+    assert '"requested_sec"' not in call["prompt"]
     assert prompt_data["user_question"] == question
     assert prompt_data["frames"] == overview["frames"]
     assert not plugin._state(event)["seen"]

@@ -59,7 +59,6 @@ class Frame:
         return {
             "frame_id": self.frame_id,
             "timestamp_sec": self.timestamp_sec,
-            "requested_sec": self.requested_sec,
             "reason": self.reason,
         }
 

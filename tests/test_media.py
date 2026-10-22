@@ -24,6 +24,8 @@ async def test_probe_seek_scene_detection_and_cache(media, sample_video, monkeyp
     assert any(abs(scene.timestamp - 1) < 0.15 for scene in scenes)
     frame = await media.extract(info, 1.25, 128, "inspect")
     assert frame.timestamp_sec == pytest.approx(1.3, abs=0.001)
+    assert frame.requested_sec == 1.25
+    assert "requested_sec" not in frame.metadata()
     assert (frame.width, frame.height) == (128, 72)
     assert frame.path.read_bytes().startswith(b"\xff\xd8")
 
@@ -33,6 +35,7 @@ async def test_probe_seek_scene_detection_and_cache(media, sample_video, monkeyp
     monkeypatch.setattr(media, "_run", unexpected_run)
     cached = await media.extract(info, 1.25, 128, "scene_change")
     assert cached.frame_id == frame.frame_id
+    assert cached.requested_sec == 1.25
     assert cached.reason == "scene_change"
     assert await media.scenes(info) == scenes
 

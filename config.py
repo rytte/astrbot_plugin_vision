@@ -10,6 +10,7 @@ class Settings:
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
     allowed_video_roots: tuple[str, ...] = ()
+    overview_model_enabled: bool = False
     overview_provider_id: str = ""
     asr_enabled: bool = False
     asr_provider_id: str = ""

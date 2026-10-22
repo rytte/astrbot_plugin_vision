@@ -244,8 +244,13 @@ class VisionPlugin(Star):
                             "当前问题的回看次数已用尽，请基于现有证据回答；不足之处应明确说明"
                         )
                     state["inspect_calls"] += 1
+                delegated = (
+                    action == "overview"
+                    and self.settings.overview_model_enabled
+                    and bool(self.settings.overview_provider_id)
+                )
                 image_context = None
-                if action == "inspect" or not self.settings.overview_provider_id:
+                if not delegated:
                     image_context = event.get_extra("vision_agent_context")
                     if image_context is None:
                         raise VideoError(
@@ -269,7 +274,7 @@ class VisionPlugin(Star):
                         # 在释放请求锁前返还额度，避免参数纠错耗尽回看机会。
                         state["inspect_calls"] -= 1
                     raise
-                if action == "overview" and self.settings.overview_provider_id:
+                if delegated:
                     await self._enhance_asr(event, result, deadline)
                     content = await asyncio.wait_for(
                         self._describe_overview(event, result),
@@ -494,7 +499,7 @@ class VisionPlugin(Star):
     async def video_overview(
         self, event: AstrMessageEvent, video_path: str
     ) -> CallToolResult:
-        """查看本地视频的全片概览。未配置概览看图模型时返回带时间戳的图片，配置后返回指定模型生成的文字概览及帧索引。启用且配置可用 ASR 时附带音轨分段转写；分段范围不是逐字时间戳。混合定时和场景变化抽帧，默认间隔4秒、最多200帧；超预算时降低密度但覆盖全片。概览不是完整事件记录，没看到不代表没发生，证据不足时调用video_inspect核验原图。相同问题不重复获取概览。
+        """查看本地视频的全片概览。默认返回带实际时间戳的图片；启用并选择概览看图模型后，返回指定模型生成的文字概览及帧索引。启用且配置可用 ASR 时附带音轨分段转写；分段范围不是逐字时间戳。混合定时和场景变化抽帧，默认间隔4秒、最多200帧；超预算时降低密度但覆盖全片。概览不是完整事件记录，没看到不代表没发生，证据不足时调用video_inspect核验原图。相同问题不重复获取概览。
 
         Args:
             video_path(string): 视频资源提示中的真实本地路径，不是网址；不要猜测其他用户的路径。

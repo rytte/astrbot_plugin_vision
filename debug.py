@@ -344,6 +344,7 @@ class DebugSessions:
     def _frame(frame: Frame) -> dict:
         return {
             **frame.metadata(),
+            "requested_sec": frame.requested_sec,
             "width": frame.width,
             "height": frame.height,
             "bytes": frame.path.stat().st_size if frame.path.is_file() else 0,

@@ -351,6 +351,7 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
         assert prepared["system_prompt"] == shared.system_prompt
         assert prepared["presentation"] == shared.presentation
         assert "private-key" not in json.dumps(prepared)
+        assert '"requested_sec"' not in prepared["prompt"]
         payload = json.loads(prepared["prompt"].split("\n", 1)[1])
         assert [frame["frame_id"] for frame in payload["frames"]] == original_ids
         assert all(

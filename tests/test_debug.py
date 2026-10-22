@@ -72,6 +72,9 @@ async def test_real_debug_steps_preview_and_isolation(sessions, sample_video):
             assert (source["frame"]["width"], source["frame"]["height"]) == (320, 180)
     snapshot = sessions.snapshot(session)
     assert snapshot["done"] and not snapshot["running"]
+    assert [frame["requested_sec"] for frame in snapshot["frames"]] == [
+        frame.requested_sec for frame in session.pipeline.frames
+    ]
     assert snapshot["result"]["total_image_bytes"] > 0
     assert "video_path" not in snapshot["info"]
     assert "video_path" not in snapshot["result"]
