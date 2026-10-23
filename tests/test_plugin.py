@@ -1077,17 +1077,16 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert overview["overview_provider_id"] == "configured-vision"
     assert overview["overview_text"] == "0 秒（首帧）：红色画面。"
     assert overview["new_frame_count"] == 0
-    cells = overview["presentation"]["images"]
-    assert all("cells" not in image for image in cells)
-    assert overview["submitted_frame_count"] == len(cells) > 0
+    assert "presentation" not in overview
+    assert overview["submitted_frame_count"] > 0
     assert "frames" not in overview
-    assert json.dumps(overview).count('"timestamp_sec"') == len(cells)
-    assert json.dumps(overview).count('"reason"') == len(cells)
+    assert '"timestamp_sec"' not in json.dumps(overview)
+    assert '"reason"' not in json.dumps(overview)
     assert overview["remaining_inspect_calls"] == 3
     call = plugin.context.llm_generate.await_args.kwargs
     assert call["chat_provider_id"] == "configured-vision"
     assert call["contexts"] == [] and call["tools"] is None
-    assert len(call["image_urls"]) == len(cells)
+    assert len(call["image_urls"]) == overview["submitted_frame_count"]
     for path in call["image_urls"]:
         assert await asyncio.to_thread(Path(path).is_file)
     prompt_data = json.loads(call["prompt"].split("\n", 1)[1])
@@ -1096,10 +1095,12 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert "frame_id" not in json.dumps(overview)
     assert prompt_data["user_question"] == question
     assert "frames" not in prompt_data
+    presentation = prompt_data["presentation"]
+    cells = presentation["images"]
+    assert all("cells" not in image for image in cells)
+    assert len(cells) == overview["submitted_frame_count"]
     assert call["prompt"].count('"timestamp_sec"') == len(cells)
     assert call["prompt"].count('"reason"') == len(cells)
-    presentation = overview["presentation"]
-    assert prompt_data["presentation"] == presentation
     assert presentation["mime_type"] == "image/jpeg"
     assert all("mime_type" not in image for image in presentation["images"])
     with Image.open(call["image_urls"][0]) as image:
@@ -1456,7 +1457,7 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     prompt = json.loads(call["prompt"].split("\n", 1)[1])
     assert "frame_id" not in call["prompt"] + call["system_prompt"]
     assert "frame_id" not in json.dumps(overview)
-    assert prompt["presentation"] == overview["presentation"]
+    assert "presentation" not in overview
     assert "frames" not in overview and "frames" not in prompt
     cells = [
         cell for image in prompt["presentation"]["images"] for cell in image["cells"]
@@ -1466,8 +1467,8 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     assert [cell["timestamp_sec"] for cell in cells] == sorted(
         cell["timestamp_sec"] for cell in cells
     )
-    assert json.dumps(overview).count('"timestamp_sec"') == len(cells)
-    assert json.dumps(overview).count('"reason"') == len(cells)
+    assert '"timestamp_sec"' not in json.dumps(overview)
+    assert '"reason"' not in json.dumps(overview)
     assert call["prompt"].count('"timestamp_sec"') == len(cells)
     assert call["prompt"].count('"reason"') == len(cells)
     assert prompt["presentation"]["mime_type"] == "image/png"
