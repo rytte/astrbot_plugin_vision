@@ -337,6 +337,7 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
 ):
     sessions, session = experiment
     original_ids = [frame.frame_id for frame in session.pipeline.kept]
+    original_times = [frame.timestamp_sec for frame in session.pipeline.kept]
     monkeypatch.setattr(
         session.pipeline.media,
         "extract",
@@ -350,14 +351,30 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
         assert prepared["prompt"] == shared.prompt
         assert prepared["system_prompt"] == shared.system_prompt
         assert prepared["presentation"] == shared.presentation
+        assert shared.presentation["mime_type"] == (
+            "image/png" if mode == "grid" else "image/jpeg"
+        )
+        assert all("mime_type" not in image for image in shared.presentation["images"])
         assert "private-key" not in json.dumps(prepared)
         assert '"requested_sec"' not in prepared["prompt"]
+        assert "frame_id" not in json.dumps(prepared)
+        assert not any(frame_id in json.dumps(prepared) for frame_id in original_ids)
         payload = json.loads(prepared["prompt"].split("\n", 1)[1])
-        assert [frame["frame_id"] for frame in payload["frames"]] == original_ids
-        assert all(
-            not {"x", "y", "width", "height"}.intersection(cell)
+        assert "frames" not in payload
+        cells = [
+            cell
             for image in payload["presentation"]["images"]
-            for cell in image["cells"]
+            for cell in image.get("cells", [image])
+        ]
+        assert [cell["timestamp_sec"] for cell in cells] == original_times
+        assert [cell["reason"] for cell in cells] == [
+            frame.reason for frame in session.pipeline.kept
+        ]
+        assert json.dumps(payload).count('"timestamp_sec"') == len(cells)
+        assert json.dumps(payload).count('"reason"') == len(cells)
+        assert [frame.frame_id for frame in session.pipeline.kept] == original_ids
+        assert all(
+            not {"x", "y", "width", "height"}.intersection(cell) for cell in cells
         )
         if mode == "grid":
             assert all(
@@ -366,6 +383,9 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
                 for image in payload["presentation"]["images"]
             )
         else:
+            assert all(
+                "cells" not in image for image in payload["presentation"]["images"]
+            )
             assert (
                 payload["presentation"]["frame_width"],
                 payload["presentation"]["frame_height"],
@@ -375,7 +395,16 @@ async def test_preview_matches_chat_and_switching_modes_never_extracts(
                 for image in payload["presentation"]["images"]
             )
         image = await sessions.image(session, "model", 0, "full", 0, prepared["id"])
-        assert image["image"]["cells"] == payload["presentation"]["images"][0]["cells"]
+        debug_cells = image["image"]["cells"]
+        assert all("frame_id" in cell for cell in debug_cells)
+        assert [
+            {key: value for key, value in cell.items() if key != "frame_id"}
+            for cell in debug_cells
+        ] == (
+            payload["presentation"]["images"][0]["cells"]
+            if mode == "grid"
+            else [payload["presentation"]["images"][0]]
+        )
         assert (
             base64.b64decode(image["data_url"].split(",")[1])
             == shared.images[0].path.read_bytes()

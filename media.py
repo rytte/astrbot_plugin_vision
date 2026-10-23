@@ -55,12 +55,15 @@ class Frame:
     fingerprint: tuple[int, ...]
     quality: float
 
-    def metadata(self) -> dict:
-        return {
-            "frame_id": self.frame_id,
+    def metadata(self, *, include_frame_id: bool = False) -> dict:
+        """模型可见的帧说明；调试输出可显式附带内部标识。"""
+        data = {
             "timestamp_sec": self.timestamp_sec,
             "reason": self.reason,
         }
+        if include_frame_id:
+            data["frame_id"] = self.frame_id
+        return data
 
 
 class FFmpegMedia:

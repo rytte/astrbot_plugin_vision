@@ -618,6 +618,9 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     descriptions = image_metadata(image_message)
     expected_mode = output_mode if tool_name == "video_overview" else "frames"
     assert metadata["presentation"]["mode"] == expected_mode
+    expected_mime = "image/png" if expected_mode == "grid" else "image/jpeg"
+    assert metadata["presentation"]["mime_type"] == expected_mime
+    assert all("mime_type" not in description for description in descriptions)
     frames = (
         [cell for description in descriptions for cell in description["cells"]]
         if expected_mode == "grid"
@@ -641,7 +644,9 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
             image.image_url.url.split(",", 1)[1]
         ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     serialized = json.dumps([message.model_dump() for message in messages])
-    assert all(serialized.count(frame["frame_id"]) == 1 for frame in frames)
+    assert serialized.count("mime_type") == 1
+    assert "frame_id" not in serialized
+    assert not any(frame_id in serialized for frame_id in plugin._state(event)["seen"])
     if asr_enabled:
         assert metadata["asr"]["status"] == "success"
         assert (
@@ -675,7 +680,8 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     assert history[0]["content"] == messages[0].model_dump()["content"]
     assert history[image_index]["content"] == image_message.model_dump()["content"]
     saved = json.dumps(history)
-    assert all(saved.count(frame["frame_id"]) == 1 for frame in frames)
+    assert "frame_id" not in saved
+    assert not any(frame_id in saved for frame_id in plugin._state(event)["seen"])
     if asr_enabled:
         assert saved.count(json.dumps(asr_provider.get_text.return_value)[1:-1]) == 1
 
@@ -983,7 +989,8 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
         ) == await asyncio.to_thread(Path(image.image_url.id).read_bytes)
     descriptions = image_metadata(event.agent_context.messages[-1])
     assert len(descriptions) == len(images)
-    assert {frame["frame_id"] for frame in descriptions} == plugin._state(event)["seen"]
+    assert len(plugin._state(event)["seen"]) == len(descriptions)
+    assert "frame_id" not in json.dumps(descriptions)
     assert "frames" not in data(result)
     assert "images" not in data(result)["presentation"]
     assert data(result)["sampling"]["requested_interval_sec"] == 4
@@ -1070,20 +1077,31 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     assert overview["overview_provider_id"] == "configured-vision"
     assert overview["overview_text"] == "0 秒（首帧）：红色画面。"
     assert overview["new_frame_count"] == 0
-    assert overview["submitted_frame_count"] == len(overview["frames"]) > 0
+    cells = overview["presentation"]["images"]
+    assert all("cells" not in image for image in cells)
+    assert overview["submitted_frame_count"] == len(cells) > 0
+    assert "frames" not in overview
+    assert json.dumps(overview).count('"timestamp_sec"') == len(cells)
+    assert json.dumps(overview).count('"reason"') == len(cells)
     assert overview["remaining_inspect_calls"] == 3
     call = plugin.context.llm_generate.await_args.kwargs
     assert call["chat_provider_id"] == "configured-vision"
     assert call["contexts"] == [] and call["tools"] is None
-    assert len(call["image_urls"]) == len(overview["frames"])
+    assert len(call["image_urls"]) == len(cells)
     for path in call["image_urls"]:
         assert await asyncio.to_thread(Path(path).is_file)
     prompt_data = json.loads(call["prompt"].split("\n", 1)[1])
     assert '"requested_sec"' not in call["prompt"]
+    assert "frame_id" not in call["prompt"] + call["system_prompt"]
+    assert "frame_id" not in json.dumps(overview)
     assert prompt_data["user_question"] == question
-    assert prompt_data["frames"] == overview["frames"]
+    assert "frames" not in prompt_data
+    assert call["prompt"].count('"timestamp_sec"') == len(cells)
+    assert call["prompt"].count('"reason"') == len(cells)
     presentation = overview["presentation"]
     assert prompt_data["presentation"] == presentation
+    assert presentation["mime_type"] == "image/jpeg"
+    assert all("mime_type" not in image for image in presentation["images"])
     with Image.open(call["image_urls"][0]) as image:
         assert (presentation["frame_width"], presentation["frame_height"]) == image.size
     assert all(
@@ -1102,8 +1120,11 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     record_tool_result(event, "video_inspect", inspected)
     assert len(image_parts(event)) == data(inspected)["new_frame_count"] > 0
     assert (
-        image_metadata(event.agent_context.messages[-1])[0]["frame_id"]
-        == overview["frames"][0]["frame_id"]
+        image_metadata(event.agent_context.messages[-1])[0]["timestamp_sec"]
+        == cells[0]["timestamp_sec"]
+    )
+    assert "frame_id" not in json.dumps(
+        image_metadata(event.agent_context.messages[-1])
     )
     plugin.context.llm_generate.assert_awaited_once()
 
@@ -1377,7 +1398,8 @@ async def test_grid_overview_sends_pngs_and_keeps_inspect_independent(
     assert len(cells) == overview["new_frame_count"]
     assert "frames" not in overview
     assert "images" not in overview["presentation"]
-    assert plugin._state(event)["seen"] == {frame["frame_id"] for frame in cells}
+    assert len(plugin._state(event)["seen"]) == len(cells)
+    assert "frame_id" not in json.dumps(descriptions)
     inspected = await plugin.video_inspect(
         event, str(sample_video), mode="timestamps", times_sec=[0], max_edge=256
     )
@@ -1397,7 +1419,9 @@ async def test_grid_omits_already_seen_frames_and_updates_cell_numbers(
     )
     assert not inspected.isError
     record_tool_result(event, "video_inspect", inspected)
-    seen = image_metadata(event.agent_context.messages[-1])[0]["frame_id"]
+    seen = image_metadata(event.agent_context.messages[-1])[0]["timestamp_sec"]
+    seen_ids = set(plugin._state(event)["seen"])
+    assert len(seen_ids) == 1
     result = await plugin.video_overview(event, str(sample_video))
     assert not result.isError
     overview = data(result)
@@ -1408,7 +1432,9 @@ async def test_grid_omits_already_seen_frames_and_updates_cell_numbers(
         for image in image_metadata(event.agent_context.messages[-1])
         for cell in image["cells"]
     ]
-    assert seen not in {cell["frame_id"] for cell in cells}
+    assert seen not in {cell["timestamp_sec"] for cell in cells}
+    assert seen_ids < plugin._state(event)["seen"]
+    assert "frame_id" not in json.dumps(cells)
     assert [cell["frame_number"] for cell in cells] == list(range(1, len(cells) + 1))
     assert len(cells) == overview["new_frame_count"]
 
@@ -1428,7 +1454,24 @@ async def test_delegated_model_receives_grid_with_frame_mapping(
     assert len(call["image_urls"]) == overview["submitted_image_count"]
     assert all(Path(path).suffix == ".png" for path in call["image_urls"])
     prompt = json.loads(call["prompt"].split("\n", 1)[1])
+    assert "frame_id" not in call["prompt"] + call["system_prompt"]
+    assert "frame_id" not in json.dumps(overview)
     assert prompt["presentation"] == overview["presentation"]
+    assert "frames" not in overview and "frames" not in prompt
+    cells = [
+        cell for image in prompt["presentation"]["images"] for cell in image["cells"]
+    ]
+    assert len(cells) == overview["submitted_frame_count"]
+    assert [cell["frame_number"] for cell in cells] == list(range(1, len(cells) + 1))
+    assert [cell["timestamp_sec"] for cell in cells] == sorted(
+        cell["timestamp_sec"] for cell in cells
+    )
+    assert json.dumps(overview).count('"timestamp_sec"') == len(cells)
+    assert json.dumps(overview).count('"reason"') == len(cells)
+    assert call["prompt"].count('"timestamp_sec"') == len(cells)
+    assert call["prompt"].count('"reason"') == len(cells)
+    assert prompt["presentation"]["mime_type"] == "image/png"
+    assert all("mime_type" not in image for image in prompt["presentation"]["images"])
     assert all(
         "frame_width" in image and "frame_height" in image
         for image in prompt["presentation"]["images"]

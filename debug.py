@@ -343,7 +343,7 @@ class DebugSessions:
     @staticmethod
     def _frame(frame: Frame) -> dict:
         return {
-            **frame.metadata(),
+            **frame.metadata(include_frame_id=True),
             "requested_sec": frame.requested_sec,
             "width": frame.width,
             "height": frame.height,
@@ -518,7 +518,10 @@ class DebugSessions:
         return {
             "data_url": f"data:{image.mime_type};base64,"
             + base64.b64encode(buffer.getvalue()).decode(),
-            "image": {**image.metadata(), "bytes": image.path.stat().st_size},
+            "image": {
+                **image.metadata(include_frame_id=True),
+                "bytes": image.path.stat().st_size,
+            },
         }
 
     async def close(self) -> None:

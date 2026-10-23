@@ -75,6 +75,9 @@ async def test_real_debug_steps_preview_and_isolation(sessions, sample_video):
     assert [frame["requested_sec"] for frame in snapshot["frames"]] == [
         frame.requested_sec for frame in session.pipeline.frames
     ]
+    assert [frame["frame_id"] for frame in snapshot["frames"]] == [
+        frame.frame_id for frame in session.pipeline.frames
+    ]
     assert snapshot["result"]["total_image_bytes"] > 0
     assert "video_path" not in snapshot["info"]
     assert "video_path" not in snapshot["result"]
@@ -107,6 +110,8 @@ async def test_grid_debug_output_preview_metadata_and_reset(sessions, sample_vid
     presentation = snapshot["result"]["presentation"]
     assert snapshot["parameters"]["overview_output_mode"] == "grid"
     assert presentation["image_count"] < presentation["frame_count"]
+    assert presentation["mime_type"] == "image/png"
+    assert all("mime_type" not in image for image in presentation["images"])
     assert all(
         (image["frame_width"], image["frame_height"])
         == (session.pipeline.kept[0].width, session.pipeline.kept[0].height)
@@ -119,7 +124,13 @@ async def test_grid_debug_output_preview_metadata_and_reset(sessions, sample_vid
     )
     assert snapshot["result"]["output_image_bytes"] == presentation["total_bytes"]
     preview = await sessions.image(session, "grid", 0, "full", session.revision)
-    assert preview["image"]["cells"] == presentation["images"][0]["cells"]
+    assert preview["image"]["mime_type"] == presentation["mime_type"]
+    assert "frame_id" not in json.dumps(presentation)
+    assert all("frame_id" in cell for cell in preview["image"]["cells"])
+    assert [
+        {key: value for key, value in cell.items() if key != "frame_id"}
+        for cell in preview["image"]["cells"]
+    ] == presentation["images"][0]["cells"]
     assert preview["image"]["frame_width"] == presentation["images"][0]["frame_width"]
     assert preview["image"]["frame_height"] == presentation["images"][0]["frame_height"]
     assert preview["data_url"].startswith("data:image/png;base64,")

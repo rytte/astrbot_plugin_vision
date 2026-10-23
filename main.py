@@ -390,17 +390,16 @@ class VisionPlugin(Star):
                     )
                 )
                 # 帧明细只随图片提供；工具结果保留呈现统计，避免模型重复读取。
+                presentation = presentation_metadata(output_mode, images)
                 result.data["presentation"] = {
-                    key: value
-                    for key, value in presentation_metadata(output_mode, images).items()
-                    if key != "images"
+                    key: value for key, value in presentation.items() if key != "images"
                 }
                 result.data["submitted_image_count"] = len(images)
                 image_parts = []
                 for index, image in enumerate(images):
                     image_bytes = await asyncio.to_thread(image.path.read_bytes)
                     metadata = (
-                        image.metadata()
+                        presentation["images"][index]
                         if output_mode == "grid"
                         else frames[index].metadata()
                     )
@@ -546,7 +545,6 @@ class VisionPlugin(Star):
     ) -> CallToolResult:
         provider_id = self.settings.overview_provider_id
         question = self._state(event)["question"] or getattr(event, "message_str", "")
-        frame_metadata = [frame.metadata() for frame in result.frames]
         prepared = await prepare_overview_input(self.media, result, question)
         response = await invoke_overview_model(self.context, provider_id, prepared)
         result.data.update(
@@ -554,7 +552,6 @@ class VisionPlugin(Star):
                 "overview_mode": "delegated",
                 "overview_provider_id": provider_id,
                 "overview_text": response.completion_text.strip(),
-                "frames": frame_metadata,
                 "submitted_frame_count": len(result.frames),
                 "submitted_image_count": len(prepared.images),
                 "presentation": prepared.presentation,

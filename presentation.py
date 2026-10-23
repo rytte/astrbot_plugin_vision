@@ -28,7 +28,7 @@ class OutputImage:
     cells: list[dict]
     frame_size: tuple[int, int] | None = None
 
-    def metadata(self) -> dict:
+    def metadata(self, *, include_frame_id: bool = False) -> dict:
         data = {
             "width": self.width,
             "height": self.height,
@@ -36,7 +36,14 @@ class OutputImage:
         }
         if self.frame_size is not None:
             data["frame_width"], data["frame_height"] = self.frame_size
-        data["cells"] = self.cells
+        data["cells"] = (
+            self.cells
+            if include_frame_id
+            else [
+                {key: value for key, value in cell.items() if key != "frame_id"}
+                for cell in self.cells
+            ]
+        )
         return data
 
 
@@ -55,6 +62,12 @@ def presentation_metadata(mode: str, images: list[OutputImage]) -> dict:
         ),
         "images": [image.metadata() for image in images],
     }
+    if images:
+        mime_types = {image.mime_type for image in images}
+        if len(mime_types) == 1:
+            data["mime_type"] = next(iter(mime_types))
+            for image in data["images"]:
+                del image["mime_type"]
     if mode == "frames" and images:
         sizes = {(image.width, image.height) for image in images}
         if len(sizes) == 1:
@@ -62,6 +75,10 @@ def presentation_metadata(mode: str, images: list[OutputImage]) -> dict:
             data["note"] += "帧尺寸共用 frame_width/frame_height。"
             for image in data["images"]:
                 del image["width"], image["height"]
+    if mode == "frames":
+        for image in data["images"]:
+            if len(image["cells"]) == 1:
+                image.update(image.pop("cells")[0])
     return data
 
 
@@ -91,7 +108,7 @@ def _grid(media: FFmpegMedia, frames: list[Frame], offset: int) -> OutputImage:
         row, column = divmod(index, columns)
         cells.append(
             {
-                **frame.metadata(),
+                **frame.metadata(include_frame_id=True),
                 "frame_number": offset + index + 1,
                 "row": row + 1,
                 "column": column + 1,
@@ -148,7 +165,12 @@ async def present_frames(
                 "image/jpeg",
                 frame.width,
                 frame.height,
-                [{**frame.metadata(), "frame_number": index + 1}],
+                [
+                    {
+                        **frame.metadata(include_frame_id=True),
+                        "frame_number": index + 1,
+                    }
+                ],
             )
             for index, frame in enumerate(frames)
         ]

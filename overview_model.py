@@ -14,7 +14,7 @@ from .presentation import OutputImage, present_frames, presentation_metadata
 SYSTEM_PROMPT = (
     "你负责为另一个模型观察视频采样帧，不是最终对话助手。"
     "输出整体概览、按时间排序的可见事件、与用户问题相关的证据，以及不确定或建议回看的时间范围。"
-    "事件必须标注提供的实际时间戳，重要证据附 frame_id。"
+    "事件和重要证据必须标注提供的实际时间戳。"
     "严格区分画面可见事实与推测，不得补全采样间隙中的动作，不得从没看到某事件推断其没有发生。"
     "如果提供 asr，应结合音轨转写辅助理解，但须区分语音转写与画面可见事实，转写也可能误识别。"
     "ASR 时间只表示音频分段范围，不是逐字或逐句时间戳，不得编造更精确的说话时间。"
@@ -44,7 +44,6 @@ async def prepare_overview_input(
     payload = {
         "duration_sec": result.data["duration_sec"],
         "sampling": result.data["sampling"],
-        "frames": [frame.metadata() for frame in result.frames],
         "presentation": presentation,
         "user_question": str(question)[:4000],
     }
@@ -52,9 +51,10 @@ async def prepare_overview_input(
         payload["asr"] = result.data["asr"]
     prompt = (
         "请根据以下采样信息和按顺序附上的视频帧，生成简洁的视频概览。"
-        "图片与 presentation.images 数组一一对应。独立帧模式每图一帧；"
-        "九宫格模式按从左到右、从上到下阅读，cells 标明每格的帧编号、位置、实际时间及 frame_id。"
-        "使用实际 timestamp_sec 和 frame_id 引用证据，标签与边框不属于原视频画面。\n"
+        "图片与 presentation.images 数组一一对应。独立帧模式每图一帧，"
+        "帧编号、实际时间和入选原因直接记录在 images 的对应项；"
+        "九宫格模式按从左到右、从上到下阅读，cells 标明每格的帧编号、位置和实际时间。"
+        "使用实际 timestamp_sec 引用证据，标签与边框不属于原视频画面。\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     return OverviewModelInput(prompt, presentation, images)

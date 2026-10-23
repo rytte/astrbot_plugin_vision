@@ -338,7 +338,7 @@ function renderOutput(parent) {
   stats(parent, [["概览输出模式", presentation.mode === "grid" ? "九宫格" : "独立帧"], ["实际发送图片", presentation.image_count + " 张"], ["输出图片体积", bytes(presentation.total_bytes)], ["输出总像素", number(presentation.total_pixels / 1000000, 2) + " MP"]]);
   if (presentation.mode === "grid") {
     note(parent, "每组最多 9 帧，按从左到右、从上到下阅读。拼接保留正式抽帧后的像素尺寸，以 PNG 无损保存，编号与实际时间戳位于画面外；不足 9 帧紧凑排列。下方缩略图仅供预览，点击可按原始像素查看发送图片。");
-    gallery(parent, "九宫格输出", presentation.images, "grid", "thumb", 6);
+    gallery(parent, "九宫格输出", presentationImages(presentation), "grid", "thumb", 6);
     note(parent, "图片数量减少不代表视觉 token 一定减少。下一阶段可以复用同一批帧，分别测试两种输出并查看模型返回的用量。详细回看仍返回独立帧。");
   }
   const items = session.kept_indices.map(index => ({...session.frames[index], assetIndex: index}));
@@ -506,7 +506,7 @@ function pager(page, total, size, change) {
   return controls;
 }
 function presentationImages(presentation) {
-  return presentation.images.map(image => ({...image, width: image.width ?? presentation.frame_width, height: image.height ?? presentation.frame_height}));
+  return presentation.images.map(image => ({...image, width: image.width ?? presentation.frame_width, height: image.height ?? presentation.frame_height, mime_type: image.mime_type ?? presentation.mime_type, cells: image.cells ?? [image]}));
 }
 function gallery(parent, title, items, kind, variant = "thumb", size = 24) {
   const section = node("section"), key = session.id + "/" + session.revision + "/gallery/" + title;

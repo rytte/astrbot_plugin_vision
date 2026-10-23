@@ -26,6 +26,8 @@ async def test_probe_seek_scene_detection_and_cache(media, sample_video, monkeyp
     assert frame.timestamp_sec == pytest.approx(1.3, abs=0.001)
     assert frame.requested_sec == 1.25
     assert "requested_sec" not in frame.metadata()
+    assert "frame_id" not in frame.metadata()
+    assert frame.metadata(include_frame_id=True)["frame_id"] == frame.frame_id
     assert (frame.width, frame.height) == (128, 72)
     assert frame.path.read_bytes().startswith(b"\xff\xd8")
 

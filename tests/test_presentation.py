@@ -1,4 +1,5 @@
 import asyncio
+import json
 import threading
 import time
 from dataclasses import replace
@@ -68,6 +69,10 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count, u
             (cell["row"], cell["column"]) for cell in output.cells
         )
         metadata = output.metadata()
+        assert "frame_id" not in json.dumps(metadata)
+        assert [
+            cell["frame_id"] for cell in output.metadata(include_frame_id=True)["cells"]
+        ] == [cell["frame_id"] for cell in output.cells]
         sizes = {
             (
                 frames[cell["frame_number"] - 1].width,
@@ -115,7 +120,13 @@ async def test_grid_preserves_every_pixel_and_maps_time_in_order(media, count, u
                     assert crop.tobytes() == source.convert("RGB").tobytes()
                 cells.append(cell)
     assert [cell["frame_number"] for cell in cells] == list(range(1, count + 1))
-    assert presentation_metadata("grid", images)["frame_count"] == count
+    presentation = presentation_metadata("grid", images)
+    assert presentation["frame_count"] == count
+    if images:
+        assert presentation["mime_type"] == "image/png"
+        assert all("mime_type" not in image for image in presentation["images"])
+    else:
+        assert "mime_type" not in presentation
 
 
 @pytest.mark.parametrize("uniform", [False, True])
@@ -126,6 +137,21 @@ async def test_independent_mode_returns_original_jpegs(media, uniform):
     assert all(image.mime_type == "image/jpeg" for image in images)
     assert all("requested_sec" not in image.cells[0] for image in images)
     metadata = presentation_metadata("frames", images)
+    assert metadata["mime_type"] == "image/jpeg"
+    assert all("mime_type" not in image for image in metadata["images"])
+    assert all(image.metadata()["mime_type"] == "image/jpeg" for image in images)
+    assert all("cells" not in image for image in metadata["images"])
+    assert [
+        {key: value for key, value in image.items() if key not in {"width", "height"}}
+        for image in metadata["images"]
+    ] == [
+        {**frame.metadata(), "frame_number": index + 1}
+        for index, frame in enumerate(frames)
+    ]
+    assert "frame_id" not in json.dumps(metadata)
+    assert [image.cells[0]["frame_id"] for image in images] == [
+        frame.frame_id for frame in frames
+    ]
     if uniform:
         assert (metadata["frame_width"], metadata["frame_height"]) == (64, 48)
         assert all(
@@ -143,6 +169,27 @@ async def test_independent_mode_returns_original_jpegs(media, uniform):
     ] == [(frame.width, frame.height) for frame in frames]
 
 
+@pytest.mark.parametrize("mode", ["frames", "grid"])
+async def test_mixed_formats_keep_individual_mime_types(media, mode):
+    frames = make_frames(media, 3, uniform=True)
+    jpeg = (await present_frames(media, frames, mode="frames"))[0]
+    png = (await present_frames(media, frames, mode="grid"))[0]
+    metadata = presentation_metadata(mode, [jpeg, png])
+    assert "mime_type" not in metadata
+    assert [image["mime_type"] for image in metadata["images"]] == [
+        "image/jpeg",
+        "image/png",
+    ]
+    cells = [
+        cell for image in metadata["images"] for cell in image.get("cells", [image])
+    ]
+    assert len(cells) == metadata["frame_count"] == 4
+    assert [cell["timestamp_sec"] for cell in cells] == [
+        frames[0].timestamp_sec,
+        *[frame.timestamp_sec for frame in frames],
+    ]
+
+
 async def test_grid_cache_reuses_same_labels_but_changes_with_frame_order(
     media, monkeypatch
 ):
@@ -150,6 +197,10 @@ async def test_grid_cache_reuses_same_labels_but_changes_with_frame_order(
     first = await present_frames(media, frames)
     reversed_images = await present_frames(media, list(reversed(frames)))
     assert reversed_images[0].path != first[0].path
+    other_video = await present_frames(
+        media, [replace(frame, frame_id=f"other-{frame.frame_id}") for frame in frames]
+    )
+    assert other_video[0].path != first[0].path
     monkeypatch.setattr(Image, "new", lambda *a, **kw: pytest.fail("应复用拼图缓存"))
     cached = await present_frames(media, frames)
     assert cached == first
