@@ -79,14 +79,14 @@
     "items": {
       "overview_model_enabled": {
         "type": "bool",
-        "description": "启用概览看图模型",
-        "hint": "开启后显示模型选择项，由所选模型生成视频概览文字。关闭时概览图片直接交给主模型，已选模型会保留。仅影响 video_overview。",
+        "description": "启用视频看图模型",
+        "hint": "开启并选择模型后，由该模型分析概览和回看，主模型只接收转述文字。关闭或未选择时由主模型直接看图。",
         "default": false
       },
       "overview_provider_id": {
         "type": "string",
-        "description": "概览看图模型",
-        "hint": "选择已配置且支持图片的模型生成带时间戳的文字概览。留空时由主模型看图；调用失败直接报错，回看仍返回原图。",
+        "description": "视频看图模型",
+        "hint": "选择 AstrBot 已配置且支持图片的模型，用于 video_overview 和 video_inspect。调用失败直接报错，不自动改为主模型看图。",
         "default": "",
         "_special": "select_provider",
         "condition": {

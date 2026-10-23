@@ -18,7 +18,9 @@ class VideoInspectTool(FunctionTool):
         super().__init__(
             name="video_inspect",
             description=(
-                "按需回看视频原图。mode=range 时 times_sec 必须恰好为 [起始秒, 结束秒]；"
+                "按需回看视频。默认返回原图；启用并选择视频看图模型后，"
+                "由所选模型观察本次回看帧并返回带时间戳的文字，主模型不接收原图。"
+                "mode=range 时 times_sec 必须恰好为 [起始秒, 结束秒]；"
                 "mode=timestamps 时 times_sec 为要核实的非空时间点列表。"
                 "查看动作请用短时间范围并增加 max_frames，查看小字请提高 max_edge。"
                 "max_frames、max_edge 填 null 使用配置值，默认最多8帧、长边768。"

@@ -322,6 +322,12 @@ async def test_asr_enriches_overview_and_deduplicates_inspect(
     assert not inspected.isError
     assert data(inspected)["asr"]["segments"] == []
     assert data(inspected)["asr"]["skipped_already_provided_count"] == 1
+    if delegated:
+        call = plugin.context.llm_generate.await_args.kwargs
+        model_input = json.loads(call["prompt"].split("\n", 1)[1])
+        assert model_input["asr"]["segments"] == overview["asr"]["segments"]
+        assert model_input["asr"]["cache_hit_count"] == 1
+        assert not image_parts(event)
     record_tool_result(event, "video_inspect", inspected)
     serialized = json.dumps(
         [message.model_dump() for message in event.agent_context.messages],
@@ -1150,8 +1156,9 @@ async def test_tools_return_real_images_and_do_not_duplicate_overview(
 
 @pytest.mark.parametrize("mode", ["frames", "grid"])
 @pytest.mark.parametrize("enabled,selected", [(False, True), (True, False)])
-async def test_overview_switch_and_selection_control_delegation(
-    delegated_plugin, sample_video, mode, enabled, selected
+@pytest.mark.parametrize("action", ["overview", "inspect"])
+async def test_model_switch_and_selection_control_delegation(
+    delegated_plugin, sample_video, mode, enabled, selected, action
 ):
     plugin = delegated_plugin
     plugin.settings = replace(
@@ -1161,11 +1168,13 @@ async def test_overview_switch_and_selection_control_delegation(
         overview_output_mode=mode,
     )
     event = Event(admin=True)
-    result = await plugin.video_overview(event, str(sample_video))
+    tool = getattr(plugin, f"video_{action}")
+    arguments = {} if action == "overview" else {"mode": "timestamps", "times_sec": [0]}
+    result = await tool(event, str(sample_video), **arguments)
     assert not result.isError
-    assert data(result)["overview_mode"] == "direct"
+    assert data(result)[f"{action}_mode"] == "direct"
     plugin.context.llm_generate.assert_not_awaited()
-    record_tool_result(event, "video_overview", result)
+    record_tool_result(event, f"video_{action}", result)
     assert image_parts(event)
     assert "requested_sec" not in json.dumps(
         [message.model_dump() for message in event.agent_context.messages]
@@ -1174,11 +1183,11 @@ async def test_overview_switch_and_selection_control_delegation(
         # 关闭后保留模型选择，再开启即可继续使用。
         assert plugin.settings.overview_provider_id == "configured-vision"
         plugin.settings = replace(plugin.settings, overview_model_enabled=True)
-        delegated = await plugin.video_overview(
-            Event(admin=True, agent=False), str(sample_video)
+        delegated = await tool(
+            Event(admin=True, agent=False), str(sample_video), **arguments
         )
         assert not delegated.isError
-        assert data(delegated)["overview_mode"] == "delegated"
+        assert data(delegated)[f"{action}_mode"] == "delegated"
         plugin.context.llm_generate.assert_awaited_once()
 
 
@@ -1239,16 +1248,121 @@ async def test_selected_model_receives_frames_and_main_model_only_receives_text(
     )
     assert not inspected.isError
     assert all(content.type == "text" for content in inspected.content)
+    assert data(inspected)["inspect_mode"] == "delegated"
+    assert data(inspected)["inspect_provider_id"] == "configured-vision"
+    assert data(inspected)["remaining_inspect_calls"] == 2
+    assert "overview_text" not in data(inspected)
+    assert "presentation" not in data(inspected)
     record_tool_result(event, "video_inspect", inspected)
-    assert len(image_parts(event)) == data(inspected)["new_frame_count"] > 0
+    assert not image_parts(event)
+    call = plugin.context.llm_generate.await_args.kwargs
+    inspection_input = json.loads(call["prompt"].split("\n", 1)[1])
+    assert inspection_input["request"] == {"mode": "timestamps", "times_sec": [0]}
+    assert inspection_input["user_question"] == question
     assert (
-        image_metadata(event.agent_context.messages[-1])[0]["timestamp_sec"]
-        == cells[0]["timestamp_sec"]
+        inspection_input["presentation"]["images"][0]["timestamp_sec"]
+        == (cells[0]["timestamp_sec"])
     )
-    assert "frame_id" not in json.dumps(
-        image_metadata(event.agent_context.messages[-1])
+    assert plugin.context.llm_generate.await_count == 2
+
+
+@pytest.mark.parametrize("output_mode", ["frames", "grid"])
+@pytest.mark.parametrize(
+    "mode,times", [("range", [0.5, 1.5]), ("timestamps", [0.5, 1.5])]
+)
+async def test_delegated_inspect_receives_requested_individual_frames_without_agent(
+    delegated_plugin, sample_video, output_mode, mode, times
+):
+    plugin = delegated_plugin
+    plugin.media.settings = replace(
+        plugin.media.settings, overview_output_mode=output_mode
     )
-    plugin.context.llm_generate.assert_awaited_once()
+    event = Event(admin=True, agent=False)
+    result = await plugin.video_inspect(
+        event,
+        str(sample_video),
+        mode=mode,
+        times_sec=times,
+        max_frames=3,
+        max_edge=128,
+    )
+    assert not result.isError
+    inspection = data(result)
+    assert inspection["inspect_mode"] == "delegated"
+    assert inspection["inspect_text"] == "0 秒（首帧）：红色画面。"
+    assert inspection["new_frame_count"] == 0
+    assert inspection["remaining_inspect_calls"] == 2
+    assert "presentation" not in inspection and "frames" not in inspection
+    assert "frame_id" not in json.dumps(inspection)
+    assert "requested_sec" not in json.dumps(inspection)
+    assert not plugin._state(event)["overviews"]
+    assert not plugin._state(event)["seen"]
+    assert not image_parts(event)
+    call = plugin.context.llm_generate.await_args.kwargs
+    assert call["chat_provider_id"] == "configured-vision"
+    assert call["contexts"] == [] and call["tools"] is None
+    assert "局部回看" in call["system_prompt"]
+    assert "不是逐字" in call["system_prompt"]
+    payload = json.loads(call["prompt"].split("\n", 1)[1])
+    assert payload["request"] == {"mode": mode, "times_sec": times}
+    assert "sampling" not in payload
+    presentation = payload["presentation"]
+    assert presentation["mode"] == "frames"
+    assert presentation["mime_type"] == "image/jpeg"
+    assert presentation["frame_width"] == 128
+    assert (
+        len(call["image_urls"])
+        == inspection["submitted_frame_count"]
+        == (3 if mode == "range" else 2)
+    )
+    assert inspection["submitted_image_count"] == len(call["image_urls"])
+    timestamps = [image["timestamp_sec"] for image in presentation["images"]]
+    assert timestamps == sorted(timestamps)
+    assert all(times[0] <= timestamp <= times[1] for timestamp in timestamps)
+    for path in call["image_urls"]:
+        with Image.open(path) as image:
+            assert image.format == "JPEG" and max(image.size) <= 128
+
+
+async def test_delegated_inspect_rechecks_frames_and_enforces_call_budget(
+    delegated_plugin, sample_video
+):
+    plugin = delegated_plugin
+    event = Event(admin=True)
+    for remaining in (2, 1, 0):
+        result = await plugin.video_inspect(
+            event, str(sample_video), mode="timestamps", times_sec=[0]
+        )
+        assert not result.isError
+        assert data(result)["submitted_frame_count"] == 1
+        assert data(result)["remaining_inspect_calls"] == remaining
+    exhausted = await plugin.video_inspect(
+        event, str(sample_video), mode="timestamps", times_sec=[0]
+    )
+    assert exhausted.isError
+    assert data(exhausted)["remaining_inspect_calls"] == 0
+    assert plugin.context.llm_generate.await_count == 3
+    assert not plugin._state(event)["overviews"]
+    assert not plugin._state(event)["seen"]
+    assert not image_parts(event)
+    overview = await plugin.video_overview(event, str(sample_video))
+    assert not overview.isError
+    assert data(overview)["overview_mode"] == "delegated"
+    assert plugin.context.llm_generate.await_count == 4
+
+
+async def test_invalid_delegated_inspect_does_not_call_model_or_use_budget(
+    delegated_plugin, sample_video
+):
+    plugin = delegated_plugin
+    event = Event(admin=True, agent=False)
+    result = await plugin.video_inspect(
+        event, str(sample_video), mode="range", times_sec=[2, 1]
+    )
+    assert result.isError
+    assert data(result)["error"]["code"] == "INVALID_ARGUMENT"
+    assert data(result)["remaining_inspect_calls"] == 3
+    plugin.context.llm_generate.assert_not_awaited()
 
 
 async def test_parallel_delegated_overview_calls_selected_model_once(
@@ -1276,8 +1390,9 @@ async def test_parallel_delegated_overview_calls_selected_model_once(
         SimpleNamespace(role="assistant", completion_text=None),
     ],
 )
+@pytest.mark.parametrize("action", ["overview", "inspect"])
 async def test_delegated_failure_never_falls_back_and_allows_retry(
-    delegated_plugin, sample_video, response
+    delegated_plugin, sample_video, response, action
 ):
     plugin = delegated_plugin
     if isinstance(response, Exception):
@@ -1285,7 +1400,9 @@ async def test_delegated_failure_never_falls_back_and_allows_retry(
     else:
         plugin.context.llm_generate.return_value = response
     event = Event(admin=True)
-    result = await plugin.video_overview(event, str(sample_video))
+    tool = getattr(plugin, f"video_{action}")
+    arguments = {} if action == "overview" else {"mode": "timestamps", "times_sec": [0]}
+    result = await tool(event, str(sample_video), **arguments)
     assert result.isError
     assert all(content.type == "text" for content in result.content)
     error = data(result)["error"]
@@ -1294,25 +1411,32 @@ async def test_delegated_failure_never_falls_back_and_allows_retry(
     assert "private API detail" not in error["message"]
     assert not plugin._state(event)["seen"]
     assert not plugin._state(event)["overviews"]
+    assert not image_parts(event)
+    if action == "inspect":
+        assert data(result)["remaining_inspect_calls"] == 2
     plugin.context.llm_generate.side_effect = None
     plugin.context.llm_generate.return_value = SimpleNamespace(
         role="assistant", completion_text="重试成功"
     )
-    retry = await plugin.video_overview(event, str(sample_video))
+    retry = await tool(event, str(sample_video), **arguments)
     assert not retry.isError
-    assert data(retry)["overview_text"] == "重试成功"
+    assert data(retry)[f"{action}_text"] == "重试成功"
+    if action == "inspect":
+        assert data(retry)["remaining_inspect_calls"] == 1
 
 
+@pytest.mark.parametrize("action", ["overview", "inspect"])
 async def test_delegated_model_shares_tool_timeout(
-    delegated_plugin, sample_video, monkeypatch
+    delegated_plugin, sample_video, monkeypatch, action
 ):
     plugin = delegated_plugin
-    overview = await plugin.service.overview(str(sample_video))
+    arguments = {} if action == "overview" else {"mode": "timestamps", "times_sec": [0]}
+    result = await getattr(plugin.service, action)(str(sample_video), **arguments)
     cancelled = asyncio.Event()
 
-    async def delayed_overview(*args):
+    async def delayed_operation(*args, **kwargs):
         await asyncio.sleep(0.05)
-        return overview
+        return result
 
     async def delayed_model(**kwargs):
         try:
@@ -1321,12 +1445,14 @@ async def test_delegated_model_shares_tool_timeout(
             cancelled.set()
 
     plugin.settings = replace(plugin.settings, tool_timeout=0.2)
-    plugin.service.overview = delayed_overview
+    monkeypatch.setattr(plugin.service, action, delayed_operation)
     plugin.context.llm_generate.side_effect = delayed_model
     wait_for = AsyncMock(wraps=asyncio.wait_for)
     monkeypatch.setattr("astrbot_plugin_vision.main.asyncio.wait_for", wait_for)
     event = Event(admin=True)
-    result = await plugin.video_overview(event, str(sample_video))
+    result = await getattr(plugin, f"video_{action}")(
+        event, str(sample_video), **arguments
+    )
     assert result.isError
     assert data(result)["error"]["code"] == "TIMEOUT"
     assert wait_for.await_count == 2
@@ -1335,11 +1461,14 @@ async def test_delegated_model_shares_tool_timeout(
     assert cancelled.is_set()
     assert not plugin._state(event)["overviews"]
     assert not plugin._state(event)["seen"]
+    if action == "inspect":
+        assert data(result)["remaining_inspect_calls"] == 2
 
 
 @pytest.mark.parametrize("unload", [False, True])
+@pytest.mark.parametrize("action", ["overview", "inspect"])
 async def test_cancellation_stops_delegated_model(
-    delegated_plugin, sample_video, unload
+    delegated_plugin, sample_video, unload, action
 ):
     plugin = delegated_plugin
     started = asyncio.Event()
@@ -1354,7 +1483,10 @@ async def test_cancellation_stops_delegated_model(
 
     plugin.context.llm_generate.side_effect = delayed_model
     event = Event(admin=True)
-    task = asyncio.create_task(plugin.video_overview(event, str(sample_video)))
+    arguments = {} if action == "overview" else {"mode": "timestamps", "times_sec": [0]}
+    task = asyncio.create_task(
+        getattr(plugin, f"video_{action}")(event, str(sample_video), **arguments)
+    )
     await asyncio.wait_for(started.wait(), 10)
     if unload:
         await plugin.terminate()
