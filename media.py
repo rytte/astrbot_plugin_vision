@@ -95,6 +95,10 @@ class FFmpegMedia:
             )
         if not path.is_file() or path.stat().st_size == 0:
             raise VideoError("路径必须指向非空的普通视频文件")
+        if path.stat().st_size > self.settings.download_max_mb * 1024**2:
+            raise VideoError(
+                f"视频超过配置的大小上限（{self.settings.download_max_mb} MB）"
+            )
         return path
 
     async def check_dependencies(self) -> None:
@@ -215,6 +219,10 @@ class FFmpegMedia:
                 raise ValueError("invalid start time")
         except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError) as exc:
             raise VideoError("文件没有可读取的视频流，或缺少有效时长") from exc
+        if duration > self.settings.download_max_duration:
+            raise VideoError(
+                f"视频超过配置的时长上限（{self.settings.download_max_duration:g} 秒）"
+            )
         return VideoInfo(path, key, duration, width, height, fps, origin)
 
     async def scenes(

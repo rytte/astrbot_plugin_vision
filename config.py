@@ -4,12 +4,45 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
+CONFIG_GROUPS = {
+    "dependencies": ("ffmpeg_path", "ffprobe_path"),
+    "video_limits": ("download_max_mb", "download_max_duration"),
+    "share_video": (
+        "share_links_enabled",
+        "download_cache_max_mb",
+        "download_cookie_file",
+        "download_allow_fake_ip",
+    ),
+    "model_enhancement": (
+        "overview_model_enabled",
+        "overview_provider_id",
+        "asr_enabled",
+        "asr_provider_id",
+    ),
+    "overview": (
+        "overview_interval",
+        "overview_output_mode",
+        "overview_max_frames",
+        "overview_max_edge",
+        "scene_threshold",
+    ),
+    "inspect": ("inspect_max_frames", "inspect_max_edge", "inspect_max_calls"),
+    "runtime_cache": (
+        "max_edge_limit",
+        "tool_timeout",
+        "max_concurrency",
+        "cache_ttl",
+        "cache_max_mb",
+    ),
+}
+
 
 @dataclass(frozen=True)
 class Settings:
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
     share_links_enabled: bool = True
+    # 大小与时长上限同时用于直接附件和分享视频。
     download_max_mb: int = 200
     download_max_duration: float = 1800.0
     download_cache_max_mb: int = 1024
@@ -36,6 +69,19 @@ class Settings:
     @classmethod
     def from_mapping(cls, values: Mapping) -> Settings:
         defaults = cls()
+        values = dict(values)
+        for group, keys in CONFIG_GROUPS.items():
+            if group not in values:
+                continue
+            section = values.pop(group)
+            if not isinstance(section, Mapping):
+                raise ValueError(f"{group} 必须是配置对象")
+            unknown = set(section) - set(keys)
+            if unknown:
+                raise ValueError(
+                    f"未知视频理解配置 {group}：" + ", ".join(sorted(unknown))
+                )
+            values.update(section)
         unknown = set(values) - {field.name for field in fields(cls)}
         # 兼容旧配置中的已移除项，不再用它扩展读取范围。
         unknown.discard("allowed_video_roots")

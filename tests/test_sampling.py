@@ -91,6 +91,21 @@ def test_invalid_settings_rejected(values):
         Settings.from_mapping(values)
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"overview": None},
+        {"share_video": True},
+        {"model_enhancement": {"asr_enabled": "true"}},
+        {"inspect": {"unknown": 1}},
+        {"runtime_cache": {"overview_max_frames": 20}},
+    ],
+)
+def test_invalid_grouped_settings_rejected(values):
+    with pytest.raises(ValueError):
+        Settings.from_mapping(values)
+
+
 def test_inspect_range_uses_short_window_and_endpoints():
     points, request = inspect_timestamps(100, 99.9, "range", [10, 14], 8)
     assert len(points) == 8

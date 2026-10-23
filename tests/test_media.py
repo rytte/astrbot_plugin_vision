@@ -3,6 +3,8 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 from astrbot_plugin_vision.config import Settings
@@ -119,6 +121,35 @@ def test_path_traversal_and_external_symlink_rejected(media, tmp_path):
 def test_nonlocal_or_invalid_paths_rejected(media, path):
     with pytest.raises(VideoError):
         media.resolve_path(path)
+
+
+def test_video_at_size_limit_is_accepted(media, tmp_path):
+    media.settings = replace(media.settings, download_max_mb=1)
+    source = tmp_path / "at-limit.mp4"
+    source.write_bytes(b"x" * 1024**2)
+    assert media.resolve_path(str(source)) == source
+
+
+async def test_oversize_video_is_rejected_before_ffprobe(media, tmp_path):
+    media.settings = replace(media.settings, download_max_mb=1)
+    source = tmp_path / "oversize.mp4"
+    source.write_bytes(b"x" * (1024**2 + 1))
+    media._run = AsyncMock()
+    with pytest.raises(VideoError, match="大小上限.*1 MB"):
+        await media.probe(str(source))
+    media._run.assert_not_awaited()
+    assert source.exists()
+
+
+@pytest.mark.parametrize("limit", [2.99, 3.0])
+async def test_video_duration_limit_includes_boundary(media, sample_video, limit):
+    media.settings = replace(media.settings, download_max_duration=limit)
+    if limit < 3:
+        with pytest.raises(VideoError, match="时长上限.*2.99 秒"):
+            await media.probe(str(sample_video))
+    else:
+        assert (await media.probe(str(sample_video))).duration == pytest.approx(3)
+    assert sample_video.exists()
 
 
 async def test_timeout_and_cancellation_kill_children(media):

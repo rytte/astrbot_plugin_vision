@@ -3,7 +3,7 @@ import base64
 import json
 import shutil
 import time
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from aiocqhttp import Event as OneBotEvent
 from astrbot.api import AstrBotConfig
-from astrbot.api.message_components import Json, Plain, Reply, Video
+from astrbot.api.message_components import File, Json, Plain, Reply, Video
 from astrbot.api.star import Context
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.agent.message import (
@@ -35,7 +35,7 @@ from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.star_manager import PluginManager
 from astrbot.dashboard.services.plugin_service import PluginService
 from astrbot_plugin_vision.agent_images import ToolImageBuffer
-from astrbot_plugin_vision.config import Settings
+from astrbot_plugin_vision.config import CONFIG_GROUPS, Settings
 from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
 from astrbot_plugin_vision.tools import VideoInspectTool
@@ -172,6 +172,16 @@ def test_configuration_schema_matches_defaults(tmp_path):
     )
     config = AstrBotConfig(str(tmp_path / "config.json"), schema=schema)
     assert Settings.from_mapping(config) == Settings()
+    assert list(schema) == list(CONFIG_GROUPS)
+    for group, keys in CONFIG_GROUPS.items():
+        assert schema[group]["type"] == "object"
+        assert tuple(schema[group]["items"]) == keys
+        for item in schema[group]["items"].values():
+            assert set(item.get("condition", {})).issubset(keys)
+    schema = {
+        key: item for group in schema.values() for key, item in group["items"].items()
+    }
+    assert set(schema) == {field.name for field in fields(Settings)}
     assert "allowed_video_roots" not in schema
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""
@@ -185,11 +195,55 @@ def test_configuration_schema_matches_defaults(tmp_path):
     assert schema["asr_provider_id"]["_special"] == "select_provider_stt"
     assert schema["asr_provider_id"]["condition"] == {"asr_enabled": True}
     assert schema["share_links_enabled"]["default"] is True
+    for key in ("download_max_mb", "download_max_duration"):
+        assert "condition" not in schema[key]
+    assert schema["download_cache_max_mb"]["condition"] == {"share_links_enabled": True}
     assert schema["download_cookie_file"]["condition"] == {"share_links_enabled": True}
     assert schema["download_allow_fake_ip"]["default"] is False
     assert schema["download_allow_fake_ip"]["condition"] == {
         "share_links_enabled": True
     }
+
+
+async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
+    schema = json.loads(
+        (Path(__file__).parents[1] / "_conf_schema.json").read_text(encoding="utf-8")
+    )
+    config_path = str(tmp_path / "grouped_config.json")
+    config = AstrBotConfig(config_path, schema=schema)
+    config["video_limits"].update(download_max_mb=50, download_max_duration=90)
+    config["share_video"].update(share_links_enabled=False, download_cache_max_mb=256)
+    config["model_enhancement"].update(
+        overview_model_enabled=True,
+        overview_provider_id="configured-vision",
+        asr_enabled=True,
+        asr_provider_id="configured-asr",
+    )
+    config["overview"].update(overview_output_mode="grid", overview_interval=2)
+    config["inspect"]["inspect_max_calls"] = 5
+    config["runtime_cache"]["tool_timeout"] = 120
+    config.save_config()
+    reloaded = AstrBotConfig(config_path, schema=schema)
+    configured = VisionPlugin(plugin.context, reloaded)
+    try:
+        assert configured.settings == replace(
+            Settings(),
+            download_max_mb=50,
+            download_max_duration=90,
+            share_links_enabled=False,
+            download_cache_max_mb=256,
+            overview_model_enabled=True,
+            overview_provider_id="configured-vision",
+            asr_enabled=True,
+            asr_provider_id="configured-asr",
+            overview_output_mode="grid",
+            overview_interval=2,
+            inspect_max_calls=5,
+            tool_timeout=120,
+        )
+        assert reloaded == config
+    finally:
+        await configured.terminate()
 
 
 async def test_removed_extra_directories_are_ignored_and_default_roots_still_apply(
@@ -952,6 +1006,73 @@ async def test_quoted_video_attachment_is_supported(plugin, sample_video):
     assert resources["video_paths"] == [str(sample_video)]
 
 
+@pytest.mark.parametrize("component_type", [Video, File])
+@pytest.mark.parametrize("quoted", [False, True])
+async def test_oversize_attachments_report_limit_without_share_feature(
+    plugin, tmp_path, component_type, quoted
+):
+    plugin.settings = plugin.media.settings = replace(
+        plugin.settings, share_links_enabled=False, download_max_mb=1
+    )
+    source = tmp_path / "oversize.mp4"
+    source.write_bytes(b"x" * (1024**2 + 1))
+    component = (
+        File(name=source.name, file=str(source))
+        if component_type is File
+        else Video(file=str(source))
+    )
+    event = Event(messages=[Reply(id="1", chain=[component]) if quoted else component])
+    request = ProviderRequest(prompt="分析这个视频")
+    await plugin.prepare_video_resources(event, request)
+    resources = json.loads(request.extra_user_content_parts[0].text.split("\n")[1])
+    assert resources["video_paths"] == []
+    assert len(resources["errors"]) == 1
+    assert "大小上限（1 MB）" in resources["errors"][0]
+    assert not plugin.resources.get(plugin._owner(event))
+    result = await plugin.video_overview(event, str(source))
+    assert data(result)["error"]["code"] == "VIDEO_ERROR"
+    assert "大小上限" in data(result)["error"]["message"]
+    assert source.exists()
+    assert not list(plugin.downloads.root.iterdir())
+    plugin.context.llm_generate.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["overview", "inspect"])
+@pytest.mark.parametrize("delegated", [False, True])
+async def test_attachment_duration_limit_prevents_frame_and_model_processing(
+    plugin, sample_video, action, delegated
+):
+    plugin.settings = plugin.media.settings = replace(
+        plugin.settings,
+        share_links_enabled=False,
+        download_max_duration=1,
+        overview_model_enabled=delegated,
+        overview_provider_id="configured-vision" if delegated else "",
+    )
+    event = Event(messages=[Video(file=str(sample_video))])
+    await plugin.prepare_video_resources(event, ProviderRequest(prompt="看视频"))
+    plugin.media.scenes = AsyncMock()
+    plugin.media.extract = AsyncMock()
+    plugin.asr.enhance = AsyncMock()
+    result = (
+        await plugin.video_overview(event, str(sample_video))
+        if action == "overview"
+        else await plugin.video_inspect(
+            event, str(sample_video), mode="timestamps", times_sec=[0]
+        )
+    )
+    assert data(result)["error"]["code"] == "VIDEO_ERROR"
+    assert "时长上限（1 秒）" in data(result)["error"]["message"]
+    plugin.media.scenes.assert_not_awaited()
+    plugin.media.extract.assert_not_awaited()
+    plugin.asr.enhance.assert_not_awaited()
+    plugin.context.llm_generate.assert_not_awaited()
+    assert not plugin._state(event)["overviews"]
+    assert not image_parts(event)
+    assert sample_video.exists()
+    assert not list(plugin.downloads.root.iterdir())
+
+
 async def test_early_hook_materializes_video_once(plugin, sample_video, monkeypatch):
     original = Video.convert_to_file_path
     downloads = []
@@ -1669,7 +1790,9 @@ async def test_download_and_processing_share_one_time_budget(plugin, tmp_path):
 async def test_downloaded_duration_is_checked_before_authorization(
     plugin, sample_video
 ):
-    plugin.settings = replace(plugin.settings, download_max_duration=1)
+    plugin.settings = plugin.media.settings = replace(
+        plugin.settings, download_max_duration=1
+    )
     event = Event(messages=[Plain("https://b23.tv/abc")])
     source_id = await prepare_share(plugin, event)
 

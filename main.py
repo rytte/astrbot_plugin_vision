@@ -205,6 +205,9 @@ class VisionPlugin(Star):
                     time.monotonic() + self.settings.cache_ttl,
                 )
                 state["attachment_paths"].add(str(path))
+            except VideoError as exc:
+                logger.warning("准备视频附件失败：%s", exc)
+                errors.append(str(exc))
             except Exception as exc:
                 logger.warning("准备视频附件失败：%s", exc)
                 errors.append(
@@ -289,12 +292,10 @@ class VisionPlugin(Star):
                         max(0.0, deadline - asyncio.get_running_loop().time()),
                     )
                     path = self.media.resolve_path(str(path))
-                    info = await asyncio.wait_for(
+                    await asyncio.wait_for(
                         self.media.probe(str(path)),
                         max(0.0, deadline - asyncio.get_running_loop().time()),
                     )
-                    if info.duration > self.settings.download_max_duration:
-                        raise VideoError("分享视频超过配置的时长上限")
                     stat = path.stat()
                     self.resources.setdefault(self._owner(event), {})[str(path)] = (
                         stat.st_size,
