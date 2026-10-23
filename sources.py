@@ -8,7 +8,13 @@ from urllib.parse import urlsplit, urlunsplit
 
 from astrbot.api.message_components import Json, Plain, Reply, Share
 
-URL_PATTERN = re.compile(r"https?://[^\s<>\"'\[\]，。；！？、（）【】]+", re.I)
+SOURCE_PATTERN = re.compile(
+    r"(?P<url>[A-Za-z][A-Za-z0-9+.-]{0,31}://[^\s<>\"'`\[\]，。；！？、（）【】]+)"
+    r"|(?<![A-Za-z0-9_./:@%?&=#+-])(?:"
+    r"(?i:b23\.tv)/(?P<short>[^\s<>\"'`\[\]，。；！？、（）【】]+)"
+    r"|(?P<video_id>(?i:bv)[A-Za-z0-9]{10}|(?i:av)[1-9][0-9]*)"
+    r"(?![A-Za-z0-9_]|\.[A-Za-z0-9]))"
+)
 CARD_KEYS = {
     "url",
     "jumpurl",
@@ -81,16 +87,23 @@ def display_url(url: str) -> str:
 
 
 def extract_share_urls(components: list, raw_message=None) -> list[str]:
-    """有限扫描原始卡片及引用，忽略封面、图标等资源字段。"""
+    """有限扫描卡片及引用，支持 B 站编号和短链，忽略封面、图标等资源字段。"""
     found: dict[str, None] = {}
     budget = 512
 
     def add(text):
         if not isinstance(text, str):
             return
-        for match in URL_PATTERN.finditer(html.unescape(text[:65536])):
+        for match in SOURCE_PATTERN.finditer(html.unescape(text[:65536])):
+            if video_id := match["video_id"]:
+                prefix = "BV" if video_id[:2].lower() == "bv" else "av"
+                candidate = f"https://www.bilibili.com/video/{prefix}{video_id[2:]}"
+            elif match["short"]:
+                candidate = f"https://b23.tv/{match['short']}"
+            else:
+                candidate = match["url"]
             try:
-                url = normalize_url(match.group().rstrip(".,;!?)"))
+                url = normalize_url(candidate.rstrip(".,;!?)"))
             except ValueError:
                 continue
             if (

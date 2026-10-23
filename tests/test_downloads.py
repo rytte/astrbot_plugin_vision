@@ -90,6 +90,99 @@ def test_wrapped_network_failure_keeps_safe_reason_and_redacts_raw_error():
 
 
 @pytest.mark.parametrize(
+    "kind, expected",
+    [
+        ("timeout", "网络连接或读取超时"),
+        ("timeout_text", "网络连接或读取超时"),
+        ("http", "HTTP 403"),
+        ("http_text", "HTTP 429"),
+        ("tls", "TLS 连接或证书校验失败"),
+        ("dns", "DNS 解析失败"),
+        ("connection", "网络连接失败或下载中断"),
+        ("incomplete", "网络连接失败或下载中断"),
+        ("merge", "FFmpeg 处理失败"),
+        ("unknown", "yt-dlp 无法解析或下载"),
+    ],
+)
+def test_download_failure_classifies_wrapped_errors_without_leaking_secrets(
+    kind, expected
+):
+    from yt_dlp.networking.common import Response
+    from yt_dlp.networking.exceptions import HTTPError, SSLError, TransportError
+    from yt_dlp.utils import ContentTooShortError, DownloadError, PostProcessingError
+
+    private = "https://cdn.example/video?sign=secret Cookie=private"
+    causes = {
+        "timeout": TransportError(cause=TimeoutError(private)),
+        "timeout_text": DownloadError(f"The read operation timed out: {private}"),
+        "http": HTTPError(Response(io.BytesIO(), private, {}, 403, private)),
+        "http_text": DownloadError(f"HTTP Error 429: {private}"),
+        "tls": SSLError(private),
+        "dns": TransportError(cause=socket.gaierror(private)),
+        "connection": TransportError(private),
+        "incomplete": ContentTooShortError(10, 100),
+        "merge": PostProcessingError(private),
+        "unknown": DownloadError(private),
+    }
+    cause = causes[kind]
+    wrapped = DownloadError(private, exc_info=(type(cause), cause, None))
+    result = download_failure(wrapped, "下载媒体")
+    assert result.startswith("下载媒体失败：")
+    assert expected in result
+    assert all(value not in result for value in ("https://", "secret", "private"))
+
+
+def test_wrapped_download_rejection_keeps_specific_limit_reason():
+    from yt_dlp.utils import DownloadError
+
+    cause = DownloadRejected("分享视频超过配置的大小上限")
+    error = DownloadError("secret", exc_info=(type(cause), cause, None))
+    assert download_failure(error, "下载媒体") == str(cause)
+
+
+@pytest.mark.parametrize("phase", ["解析视频信息", "下载媒体", "合并音视频"])
+def test_download_reports_failure_stage(tmp_path, monkeypatch, phase):
+    from yt_dlp import YoutubeDL
+    from yt_dlp.utils import DownloadError, PostProcessingError
+
+    hooks = []
+
+    def fail():
+        cause = (
+            PostProcessingError("private-secret")
+            if phase == "合并音视频"
+            else TimeoutError("private-secret")
+        )
+        raise DownloadError("private-secret", exc_info=(type(cause), cause, None))
+
+    def extract(ydl, *_args, **_kwargs):
+        hooks.extend(ydl.params["postprocessor_hooks"])
+        if phase == "解析视频信息":
+            fail()
+        return {"duration": 10, "vcodec": "avc1", "protocol": "https"}
+
+    def process(_ydl, _info):
+        if phase == "合并音视频":
+            for hook in hooks:
+                hook({"status": "started", "postprocessor": "Merger"})
+        fail()
+
+    monkeypatch.setattr(YoutubeDL, "extract_info", extract)
+    monkeypatch.setattr(YoutubeDL, "process_info", process)
+    with pytest.raises(DownloadRejected, match=phase + "失败：") as caught:
+        download(
+            {
+                "directory": str(tmp_path),
+                "url": "https://example.com/video?sign=secret",
+                "max_bytes": 1024**2,
+                "max_duration": 60,
+                "ffmpeg": "ffmpeg",
+            }
+        )
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
     "extra",
     [
         {"_type": "playlist", "entries": []},

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import math
+import re
 import socket
 import sys
 from pathlib import Path
@@ -58,16 +59,21 @@ def guard_network(allow_fake_ip: bool = False) -> None:
     socket.getaddrinfo = public_addresses
 
 
-def download_failure(error: Exception) -> str:
+def download_failure(error: Exception, stage: str = "") -> str:
     """只返回固定提示，避免上游异常中的签名链接、Cookie 等内容泄露。"""
+    from yt_dlp.networking.exceptions import HTTPError, SSLError, TransportError
+    from yt_dlp.utils import ContentTooShortError, PostProcessingError
+
     pending, seen = [error], set()
+    errors = []
     while pending and len(seen) < 24:
         current = pending.pop()
         if id(current) in seen:
             continue
         seen.add(id(current))
-        if isinstance(current, NetworkRejected):
+        if isinstance(current, NetworkRejected | DownloadRejected):
             return str(current)
+        errors.append(current)
         for name in ("cause", "__cause__", "__context__"):
             cause = getattr(current, name, None)
             if isinstance(cause, BaseException):
@@ -79,7 +85,39 @@ def download_failure(error: Exception) -> str:
             and isinstance(details[1], BaseException)
         ):
             pending.append(details[1])
-    return (
+    prefix = f"{stage}失败：" if stage else ""
+    for current in errors:
+        # yt-dlp 的部分下载错误只保留文本；只提取状态码，不复制原始消息。
+        status = current.status if isinstance(current, HTTPError) else None
+        match = re.search(r"\bHTTP Error ([45]\d{2})\b", str(current), re.IGNORECASE)
+        if status is None and match:
+            status = int(match[1])
+        if status is not None:
+            reason = {
+                403: "服务器拒绝访问，请检查平台访问限制或 Cookie",
+                404: "视频或媒体地址不存在、已失效",
+                412: "平台拒绝请求，可能触发了风控，请稍后重试",
+                429: "请求过于频繁，请稍后重试",
+            }.get(status, "服务器响应异常，请稍后重试")
+            return f"{prefix}HTTP {status}，{reason}"
+    if any(
+        isinstance(current, TimeoutError)
+        or re.search(r"\b(?:timed out|timeout)\b", str(current), re.IGNORECASE)
+        for current in errors
+    ):
+        return prefix + "网络连接或读取超时，请稍后重试并检查网络或代理"
+    if any(isinstance(current, SSLError) for current in errors):
+        return prefix + "TLS 连接或证书校验失败，请检查网络、代理及系统证书"
+    if any(isinstance(current, socket.gaierror) for current in errors):
+        return prefix + "DNS 解析失败，请检查网络或代理"
+    if any(
+        isinstance(current, ConnectionError | TransportError | ContentTooShortError)
+        for current in errors
+    ):
+        return prefix + "网络连接失败或下载中断，请稍后重试并检查网络或代理"
+    if any(isinstance(current, PostProcessingError) for current in errors):
+        return prefix + "FFmpeg 处理失败，请检查 FFmpeg 配置及下载文件是否完整"
+    return prefix + (
         "yt-dlp 无法解析或下载该视频；可能需要登录、链接已失效、网络受限或平台暂不支持"
     )
 
@@ -126,6 +164,16 @@ def download(config: dict) -> None:
 
     root = Path(config["directory"])
     limit = config["max_bytes"]
+    stage = "解析视频信息"
+
+    def postprocess(info):
+        nonlocal stage
+        if info.get("status") == "started":
+            stage = (
+                "合并音视频"
+                if info.get("postprocessor") == "Merger"
+                else "处理下载文件"
+            )
 
     def progress(_):
         if (
@@ -165,6 +213,7 @@ def download(config: dict) -> None:
         "proxy": "",
         "enable_file_urls": False,
         "progress_hooks": [progress],
+        "postprocessor_hooks": [postprocess],
         "overwrites": True,
         "ffmpeg_location": config["ffmpeg"],
     }
@@ -201,10 +250,11 @@ def download(config: dict) -> None:
             if not info:
                 raise DownloadRejected("未找到可下载的视频")
             validate_info(info, config["max_duration"], limit)
+            stage = "下载媒体"
             ydl.process_info(info)
     except DownloadError as exc:
         # 不向模型或控制台复制可能包含 URL 参数/凭据的 yt-dlp 原始异常。
-        raise DownloadRejected(download_failure(exc)) from exc
+        raise DownloadRejected(download_failure(exc, stage)) from exc
     finally:
         FFmpegPostProcessor._determine_executables = original_paths
         FFmpegFD.real_download = original_download

@@ -1748,6 +1748,27 @@ async def prepare_share(plugin, event):
     ][0]["source_id"]
 
 
+@pytest.mark.parametrize(
+    "text, url",
+    [
+        ("BV186pc65E68", "https://www.bilibili.com/video/BV186pc65E68"),
+        ("av170001", "https://www.bilibili.com/video/av170001"),
+        ("b23.tv/9unK6EN", "https://b23.tv/9unK6EN"),
+    ],
+)
+async def test_bilibili_text_reaches_video_resource_prompt_without_download(
+    plugin, text, url
+):
+    event = Event(messages=[Plain(text)])
+    plugin.downloads._download = AsyncMock()
+    source_id = await prepare_share(plugin, event)
+    assert plugin.share_sources[plugin._owner(event)][source_id][0] == url
+    assert plugin._state(event)["share_sources"] == [
+        {"source_id": source_id, "url": url}
+    ]
+    plugin.downloads._download.assert_not_awaited()
+
+
 async def test_real_onebot_json_event_reaches_video_resource_prompt(plugin):
     url = "https://b23.tv/abc?share_source=qq&sign=secret"
     event = Event(messages=[Plain("看看这个视频")])
@@ -1792,12 +1813,13 @@ async def test_share_registration_is_lazy_private_and_current_message_only(plugi
     assert "secret" not in original.extra_user_content_parts[0].text
 
 
-async def test_share_feature_can_be_disabled(plugin):
+@pytest.mark.parametrize(
+    "text", ["https://b23.tv/abc", "BV186pc65E68", "av170001", "b23.tv/9unK6EN"]
+)
+async def test_share_feature_can_be_disabled(plugin, text):
     plugin.settings = replace(plugin.settings, share_links_enabled=False)
     request = ProviderRequest(prompt="看视频")
-    await plugin.prepare_video_resources(
-        Event(messages=[Plain("https://b23.tv/abc")]), request
-    )
+    await plugin.prepare_video_resources(Event(messages=[Plain(text)]), request)
     assert not request.extra_user_content_parts
     assert not plugin.share_sources
 

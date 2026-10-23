@@ -34,6 +34,86 @@ def test_noncallable_model_dump_still_extracts_components():
     ) == [url]
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("BV186pc65E68", "https://www.bilibili.com/video/BV186pc65E68"),
+        ("bv186pc65E68", "https://www.bilibili.com/video/BV186pc65E68"),
+        ("看看【BV186pc65E68】讲了什么", "https://www.bilibili.com/video/BV186pc65E68"),
+        ("av170001", "https://www.bilibili.com/video/av170001"),
+        ("看看AV170001吧", "https://www.bilibili.com/video/av170001"),
+        ("b23.tv/9unK6EN", "https://b23.tv/9unK6EN"),
+        ("B23.TV/9unK6EN", "https://b23.tv/9unK6EN"),
+        ("看看（b23.tv/9unK6EN）。", "https://b23.tv/9unK6EN"),
+        ("`b23.tv/9unK6EN`", "https://b23.tv/9unK6EN"),
+        (
+            "b23.tv/9unK6EN?share_source=qq&sign=secret",
+            "https://b23.tv/9unK6EN?share_source=qq&sign=secret",
+        ),
+    ],
+)
+def test_bilibili_identifiers_and_schemeless_short_links(text, expected):
+    assert extract_share_urls([Plain(text)]) == [expected]
+
+
+def test_mixed_bilibili_sources_keep_order_deduplicate_and_preserve_url_parameters():
+    text = (
+        "BV186pc65E68 https://www.bilibili.com/video/BV186pc65E68 "
+        "b23.tv/9unK6EN https://b23.tv/9unK6EN av170001 AV170001 "
+        "https://www.bilibili.com/video/BV186pc65E68?p=2&sign=secret "
+        "https://example.com/?id=av123"
+    )
+    raw = {"message": [{"type": "text", "data": {"text": text}}]}
+    assert extract_share_urls([Plain(text)], raw) == [
+        "https://www.bilibili.com/video/BV186pc65E68",
+        "https://b23.tv/9unK6EN",
+        "https://www.bilibili.com/video/av170001",
+        "https://www.bilibili.com/video/BV186pc65E68?p=2&sign=secret",
+        "https://example.com/?id=av123",
+    ]
+
+
+def test_bilibili_sources_in_replies_and_cards():
+    components = [
+        Reply(id="1", chain=[Plain("BV186pc65E68")]),
+        Json({"url": "b23.tv/9unK6EN", "cover": "b23.tv/ignored"}),
+        Share(url="av170001", title="视频"),
+    ]
+    assert extract_share_urls(components) == [
+        "https://b23.tv/9unK6EN",
+        "https://www.bilibili.com/video/av170001",
+        "https://www.bilibili.com/video/BV186pc65E68",
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "BV186pc65E6",
+        "BV186pc65E680",
+        "BV186pc65E6_",
+        "xBV186pc65E68",
+        "BV186pc65E68_suffix",
+        "BV186pc65E68.mp4",
+        "nav170001",
+        "av170001suffix",
+        "av0",
+        "av-1",
+        "av123.4",
+        "av170001.mp4",
+        "evil.b23.tv/9unK6EN",
+        "notb23.tv/9unK6EN",
+        "b23.tv.evil/9unK6EN",
+        "https://user:pass@b23.tv/9unK6EN",
+        "ftp://b23.tv/9unK6EN",
+        "file:///BV186pc65E68",
+        "https://localhost/BV186pc65E68",
+    ],
+)
+def test_invalid_or_embedded_bilibili_sources_are_not_extracted(text):
+    assert extract_share_urls([Plain(text)]) == []
+
+
 def test_text_card_reference_and_raw_preserve_signed_url():
     signed = "https://www.xiaohongshu.com/explore/abc?xsec_token=secret&xsec_source=pc"
     card = {
