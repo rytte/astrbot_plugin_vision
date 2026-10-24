@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import shutil
+import threading
 import time
 from dataclasses import fields, replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -38,6 +40,9 @@ from astrbot_plugin_vision.agent_images import ToolImageBuffer
 from astrbot_plugin_vision.config import CONFIG_GROUPS, Settings
 from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
+from astrbot_plugin_vision.quota import BEIJING_TZ, DailyQuota
+from astrbot_plugin_vision.sampling import InspectArgumentError
+from astrbot_plugin_vision.service import VideoResult
 from astrbot_plugin_vision.tools import VideoInspectTool
 from jsonschema import ValidationError, validate
 from PIL import Image
@@ -45,10 +50,18 @@ from PIL import Image
 
 class Event:
     def __init__(
-        self, *, admin=False, user="alice", origin="chat", messages=None, agent=True
+        self,
+        *,
+        admin=False,
+        user="alice",
+        origin="chat",
+        messages=None,
+        agent=True,
+        platform="test",
     ):
         self.admin = admin
         self.user = user
+        self.platform = platform
         self.unified_msg_origin = origin
         self.messages = messages or []
         self.extras = {}
@@ -62,6 +75,9 @@ class Event:
 
     def get_sender_id(self):
         return self.user
+
+    def get_platform_name(self):
+        return self.platform
 
     def get_messages(self):
         return self.messages
@@ -212,6 +228,7 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
     config_path = str(tmp_path / "grouped_config.json")
     config = AstrBotConfig(config_path, schema=schema)
     config["video_limits"].update(download_max_mb=50, download_max_duration=90)
+    config["user_quota"]["daily_analysis_limit"] = 8
     config["share_video"].update(share_links_enabled=False, download_cache_max_mb=256)
     config["model_enhancement"].update(
         overview_model_enabled=True,
@@ -230,6 +247,7 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
             Settings(),
             download_max_mb=50,
             download_max_duration=90,
+            daily_analysis_limit=8,
             share_links_enabled=False,
             download_cache_max_mb=256,
             overview_model_enabled=True,
@@ -1960,3 +1978,292 @@ async def test_downloaded_duration_is_checked_before_authorization(
     result = await plugin.video_overview(event, source_id)
     assert "时长上限" in data(result)["error"]["message"]
     assert not plugin.resources.get(plugin._owner(event))
+
+
+@pytest.fixture
+def quota_video(plugin, tmp_path):
+    path = tmp_path / "quota.mp4"
+    path.write_bytes(b"video")
+    # 只模拟解码，仍走真实工具入口、附件授权与持久化额度。
+    plugin.service.overview = AsyncMock(side_effect=lambda *_: VideoResult({}, []))
+    plugin.service.inspect = AsyncMock(side_effect=lambda *_, **__: VideoResult({}, []))
+    return path
+
+
+async def prepare_quota_event(plugin, path, **kwargs):
+    event = Event(messages=[Video(file=str(path))], **kwargs)
+    await plugin.prepare_video_resources(event, ProviderRequest(prompt="分析视频"))
+    return event
+
+
+async def test_daily_quota_is_per_user_across_chats_and_survives_reload(
+    plugin, quota_video
+):
+    for index in range(5):
+        event = await prepare_quota_event(plugin, quota_video, origin=f"group-{index}")
+        assert not (await plugin.video_overview(event, str(quota_video))).isError
+    # 重建插件后仍然使用同一份持久化账本。
+    reloaded = VisionPlugin(plugin.context, {})
+    try:
+        event = await prepare_quota_event(reloaded, quota_video, origin="private")
+        denied = await reloaded.video_overview(event, str(quota_video))
+        assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+        assert "5 次" in data(denied)["error"]["message"]
+        other = await prepare_quota_event(plugin, quota_video, user="bob")
+        assert not (await plugin.video_overview(other, str(quota_video))).isError
+        other_platform = await prepare_quota_event(
+            plugin, quota_video, platform="other-platform"
+        )
+        assert not (
+            await plugin.video_overview(other_platform, str(quota_video))
+        ).isError
+    finally:
+        await reloaded.terminate()
+    assert plugin.service.overview.await_count == 7
+
+
+async def test_overview_and_inspects_share_one_daily_quota(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    overview = await plugin.video_overview(event, str(quota_video))
+    assert not overview.isError
+    assert (
+        "不重复"
+        in (await plugin.video_overview(event, str(quota_video))).content[0].text
+    )
+    # 用完当日额度后，原问题仍可正常回看，不重复扣除。
+    for _ in range(plugin.settings.inspect_max_calls):
+        inspected = await plugin.video_inspect(
+            event, str(quota_video), mode="timestamps", times_sec=[0]
+        )
+        assert not inspected.isError
+    new_question = await prepare_quota_event(plugin, quota_video)
+    denied = await plugin.video_inspect(
+        new_question, str(quota_video), mode="timestamps", times_sec=[0]
+    )
+    assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+    assert plugin._state(new_question)["inspect_calls"] == 0
+    assert plugin.service.overview.await_count == 1
+    assert plugin.service.inspect.await_count == 3
+
+
+async def test_daily_quota_does_not_recharge_an_ongoing_question_after_midnight(
+    plugin, quota_video, monkeypatch
+):
+    clock = Mock()
+    clock.now.return_value = datetime(2026, 10, 24, 23, 59, 59, tzinfo=BEIJING_TZ)
+    monkeypatch.setattr("astrbot_plugin_vision.quota.datetime", clock)
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    assert not (await plugin.video_overview(event, str(quota_video))).isError
+    clock.now.return_value = datetime(2026, 10, 25, 0, 0, 0, tzinfo=BEIJING_TZ)
+    assert not (
+        await plugin.video_inspect(
+            event, str(quota_video), mode="timestamps", times_sec=[0]
+        )
+    ).isError
+    new_question = await prepare_quota_event(plugin, quota_video)
+    assert not (await plugin.video_overview(new_question, str(quota_video))).isError
+    another = await prepare_quota_event(plugin, quota_video)
+    assert (
+        data(await plugin.video_overview(another, str(quota_video)))["error"]["code"]
+        == "DAILY_QUOTA_EXCEEDED"
+    )
+
+
+async def test_administrators_are_exempt_from_daily_quota(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    plugin.daily_quota.charge = Mock(side_effect=AssertionError("管理员不应读写额度"))
+    for _ in range(6):
+        assert not (
+            await plugin.video_overview(Event(admin=True), str(quota_video))
+        ).isError
+
+
+async def test_concurrent_questions_cannot_exceed_daily_quota(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    events = [
+        await prepare_quota_event(plugin, quota_video, origin=f"group-{index}")
+        for index in range(5)
+    ]
+    results = await asyncio.gather(
+        *(plugin.video_overview(event, str(quota_video)) for event in events)
+    )
+    assert sum(not result.isError for result in results) == 1
+    assert all(
+        data(result)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+        for result in results
+        if result.isError
+    )
+    assert plugin.service.overview.await_count == 1
+
+
+async def test_concurrent_tools_in_same_question_only_charge_once(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    results = await asyncio.gather(
+        plugin.video_overview(event, str(quota_video)),
+        plugin.video_inspect(event, str(quota_video), mode="timestamps", times_sec=[0]),
+    )
+    assert all(not result.isError for result in results)
+
+
+async def test_quota_rejects_share_before_downloading(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    assert not (await plugin.video_overview(event, str(quota_video))).isError
+    shared = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, shared)
+    plugin.downloads._download = AsyncMock()
+    denied = await plugin.video_overview(shared, source_id)
+    assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+    plugin.downloads._download.assert_not_awaited()
+    assert plugin.service.overview.await_count == 1
+
+
+async def test_permission_and_inspect_argument_errors_do_not_spend_daily_quota(
+    plugin, quota_video
+):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    denied = await plugin.video_overview(Event(), str(quota_video))
+    assert data(denied)["error"]["code"] == "PERMISSION_DENIED"
+    event = await prepare_quota_event(plugin, quota_video)
+    plugin.service.inspect.side_effect = InspectArgumentError("非法时间范围")
+    invalid = await plugin.video_inspect(
+        event, str(quota_video), mode="range", times_sec=[1, 0]
+    )
+    assert data(invalid)["error"]["code"] == "INVALID_ARGUMENT"
+    assert plugin._state(event)["quota_day"] is None
+    assert plugin._state(event)["inspect_calls"] == 0
+    valid = await prepare_quota_event(plugin, quota_video)
+    assert not (await plugin.video_overview(valid, str(quota_video))).isError
+    # 已经成功分析的问题，随后出现参数错误不能返还已消耗的每日额度。
+    invalid = await plugin.video_inspect(
+        valid, str(quota_video), mode="range", times_sec=[1, 0]
+    )
+    assert data(invalid)["error"]["code"] == "INVALID_ARGUMENT"
+    another = await prepare_quota_event(plugin, quota_video)
+    assert (
+        data(await plugin.video_overview(another, str(quota_video)))["error"]["code"]
+        == "DAILY_QUOTA_EXCEEDED"
+    )
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_started_failure_or_cancellation_keeps_daily_charge(
+    plugin, quota_video, cancelled
+):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    if cancelled:
+        started = asyncio.Event()
+
+        async def slow_overview(*_):
+            started.set()
+            await asyncio.sleep(60)
+
+        plugin.service.overview.side_effect = slow_overview
+        task = asyncio.create_task(plugin.video_overview(event, str(quota_video)))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        plugin.service.overview.side_effect = VideoError("处理失败")
+        assert (await plugin.video_overview(event, str(quota_video))).isError
+    new_question = await prepare_quota_event(plugin, quota_video)
+    assert (
+        data(await plugin.video_overview(new_question, str(quota_video)))["error"][
+            "code"
+        ]
+        == "DAILY_QUOTA_EXCEEDED"
+    )
+
+
+async def test_quota_storage_error_blocks_processing(plugin, quota_video, tmp_path):
+    directory = tmp_path / "database-directory"
+    directory.mkdir()
+    plugin.daily_quota = DailyQuota(directory)
+    event = await prepare_quota_event(plugin, quota_video)
+    result = await plugin.video_overview(event, str(quota_video))
+    assert data(result)["error"]["code"] == "QUOTA_ERROR"
+    plugin.service.overview.assert_not_awaited()
+
+
+async def test_share_download_and_inspect_share_one_daily_quota(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+
+    async def copy_video(url, directory):
+        directory.mkdir()
+        path = directory / "media.mp4"
+        shutil.copyfile(quota_video, path)
+        return path
+
+    plugin.downloads._download = AsyncMock(side_effect=copy_video)
+    plugin.media.probe = AsyncMock(return_value=SimpleNamespace(duration=3))
+    event = Event(messages=[Plain("https://b23.tv/abc")])
+    source_id = await prepare_share(plugin, event)
+    assert not (await plugin.video_overview(event, source_id)).isError
+    path = next(iter(plugin.resources[plugin._owner(event)]))
+    assert not (
+        await plugin.video_inspect(event, path, mode="timestamps", times_sec=[0])
+    ).isError
+    denied = await plugin.video_overview(Event(), path)
+    assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+    plugin.downloads._download.assert_awaited_once()
+
+
+async def test_inspect_without_overview_also_charges_daily_quota(plugin, quota_video):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    assert not (
+        await plugin.video_inspect(
+            event, str(quota_video), mode="timestamps", times_sec=[0]
+        )
+    ).isError
+    next_question = await prepare_quota_event(plugin, quota_video)
+    denied = await plugin.video_overview(next_question, str(quota_video))
+    assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"
+
+
+async def test_missing_sender_cannot_bypass_daily_quota(plugin, quota_video):
+    event = await prepare_quota_event(plugin, quota_video, user="")
+    result = await plugin.video_overview(event, str(quota_video))
+    assert data(result)["error"]["code"] == "PERMISSION_DENIED"
+    plugin.service.overview.assert_not_awaited()
+
+
+async def test_cancelled_quota_refund_does_not_allow_uncharged_analysis(
+    plugin, quota_video, monkeypatch
+):
+    plugin.settings = replace(plugin.settings, daily_analysis_limit=1)
+    event = await prepare_quota_event(plugin, quota_video)
+    plugin.service.inspect.side_effect = InspectArgumentError("非法时间范围")
+    loop = asyncio.get_running_loop()
+    started, refunded = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    refund = plugin.daily_quota.refund
+
+    def delayed_refund(*args):
+        loop.call_soon_threadsafe(started.set)
+        if not release.wait(5):
+            raise AssertionError("退款线程未释放")
+        refund(*args)
+        loop.call_soon_threadsafe(refunded.set)
+
+    monkeypatch.setattr(plugin.daily_quota, "refund", delayed_refund)
+    task = asyncio.create_task(
+        plugin.video_inspect(event, str(quota_video), mode="range", times_sec=[1, 0])
+    )
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    await asyncio.wait_for(refunded.wait(), 5)
+    assert not (await plugin.video_overview(event, str(quota_video))).isError
+    new_question = await prepare_quota_event(plugin, quota_video)
+    denied = await plugin.video_overview(new_question, str(quota_video))
+    assert data(denied)["error"]["code"] == "DAILY_QUOTA_EXCEEDED"

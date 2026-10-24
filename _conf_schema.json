@@ -34,6 +34,18 @@
       }
     }
   },
+  "user_quota": {
+    "type": "object",
+    "description": "用户额度",
+    "items": {
+      "daily_analysis_limit": {
+        "type": "int",
+        "description": "普通用户每日分析次数上限",
+        "hint": "正整数，默认每天 5 次；按北京时间每天 00:00 重置。同一平台用户跨群聊、私聊共享额度，同一条消息中的概览和回看只计一次。管理员免除此每日限制；重启或重载保留当日用量。",
+        "default": 5
+      }
+    }
+  },
   "share_video": {
     "type": "object",
     "description": "分享链接解析",

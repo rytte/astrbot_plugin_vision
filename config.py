@@ -7,6 +7,7 @@ from dataclasses import dataclass, fields
 CONFIG_GROUPS = {
     "dependencies": ("ffmpeg_path", "ffprobe_path"),
     "video_limits": ("download_max_mb", "download_max_duration"),
+    "user_quota": ("daily_analysis_limit",),
     "share_video": (
         "share_links_enabled",
         "download_cache_max_mb",
@@ -45,6 +46,7 @@ class Settings:
     # 大小与时长上限同时用于直接附件和分享视频。
     download_max_mb: int = 200
     download_max_duration: float = 1800.0
+    daily_analysis_limit: int = 5
     download_cache_max_mb: int = 1024
     download_cookie_file: str = ""
     download_allow_fake_ip: bool = False

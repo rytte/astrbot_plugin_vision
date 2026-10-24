@@ -4,7 +4,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import sqlite3
 import time
+import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from .downloads import VideoDownloads
 from .media import FFmpegMedia, VideoError
 from .overview_model import invoke_overview_model, prepare_overview_input
 from .presentation import present_frames, presentation_metadata
+from .quota import DailyQuota, DailyQuotaExceeded
 from .sampling import InspectArgumentError
 from .service import VideoResult, VideoService
 from .sources import display_url, extract_share_urls
@@ -66,6 +69,9 @@ class VisionPlugin(Star):
         )
         self.service = VideoService(self.media)
         self.asr = VideoASR(self.media)
+        self.daily_quota = DailyQuota(
+            StarTools.get_data_dir("astrbot_plugin_vision") / "daily_quota.sqlite3"
+        )
         self.downloads = VideoDownloads(
             self.settings,
             roots[0] / "plugin_data" / "astrbot_plugin_vision" / "downloads",
@@ -122,6 +128,8 @@ class VisionPlugin(Star):
                 "share_sources": [],
                 "question": "",
                 "inspect_calls": 0,
+                "quota_request_id": uuid.uuid4().hex,
+                "quota_day": None,
                 "seen": set(),
                 "overviews": set(),
                 "asr_seen": set(),
@@ -132,6 +140,37 @@ class VisionPlugin(Star):
 
     def _owner(self, event: AstrMessageEvent) -> tuple[str, str]:
         return str(event.unified_msg_origin), str(event.get_sender_id())
+
+    async def _charge_daily_quota(self, event: AstrMessageEvent) -> bool:
+        state = self._state(event)
+        if event.is_admin() or state["quota_day"] is not None:
+            return False
+        user_id = str(event.get_sender_id() or "")
+        if not user_id:
+            raise PermissionError("无法识别当前用户，暂不能进行视频分析")
+        day, charged = await asyncio.to_thread(
+            self.daily_quota.charge,
+            str(event.get_platform_name()),
+            user_id,
+            state["quota_request_id"],
+            self.settings.daily_analysis_limit,
+        )
+        state["quota_day"] = day
+        return charged
+
+    async def _refund_daily_quota(self, event: AstrMessageEvent) -> None:
+        state = self._state(event)
+        day, request_id = state["quota_day"], state["quota_request_id"]
+        # 先撤销当前问题的已记账标记；即使退款等待被取消，也不能无额度继续分析。
+        state["quota_day"] = None
+        state["quota_request_id"] = uuid.uuid4().hex
+        await asyncio.to_thread(
+            self.daily_quota.refund,
+            day,
+            str(event.get_platform_name()),
+            str(event.get_sender_id()),
+            request_id,
+        )
 
     def _prune_resources(self) -> None:
         now = time.monotonic()
@@ -287,6 +326,7 @@ class VisionPlugin(Star):
                         raise ValueError(
                             "分享视频请先获取概览，再使用返回的本地 video_path 回看"
                         )
+                    await self._charge_daily_quota(event)
                     path = await asyncio.wait_for(
                         stack.enter_async_context(self.downloads.acquire(source[0])),
                         max(0.0, deadline - asyncio.get_running_loop().time()),
@@ -325,7 +365,6 @@ class VisionPlugin(Star):
                         raise VideoError(
                             "当前问题的回看次数已用尽，请基于现有证据回答；不足之处应明确说明"
                         )
-                    state["inspect_calls"] += 1
                 delegated = self.settings.overview_model_enabled and bool(
                     self.settings.overview_provider_id
                 )
@@ -337,6 +376,9 @@ class VisionPlugin(Star):
                             "视频帧需要 AstrBot 内置 Agent 的运行上下文；"
                             "请使用内置 Agent 并确保本插件的 on_agent_begin 钩子正常执行"
                         )
+                charged = await self._charge_daily_quota(event)
+                if action == "inspect":
+                    state["inspect_calls"] += 1
                 operation = (
                     self.service.overview(str(path))
                     if action == "overview"
@@ -351,6 +393,8 @@ class VisionPlugin(Star):
                     if action == "inspect":
                         # 在释放请求锁前返还额度，避免参数纠错耗尽回看机会。
                         state["inspect_calls"] -= 1
+                        if charged:
+                            await self._refund_daily_quota(event)
                     raise
                 if delegated:
                     await self._enhance_asr(event, result, deadline, for_model=True)
@@ -446,6 +490,11 @@ class VisionPlugin(Star):
                         )
                     ]
                 )
+        except DailyQuotaExceeded as exc:
+            code, message = "DAILY_QUOTA_EXCEEDED", str(exc)
+        except sqlite3.Error as exc:
+            logger.error("视频分析额度存储失败：%s", exc)
+            code, message = "QUOTA_ERROR", "视频分析额度暂不可用，请联系管理员检查存储"
         except PermissionError as exc:
             code, message = "PERMISSION_DENIED", str(exc)
         except (TypeError, ValueError) as exc:
