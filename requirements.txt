@@ -1,2 +1,7 @@
 Pillow>=10.0
-yt-dlp[default]>=2026.10.21
+# yt-dlp 与 EJS 需配套更新；按需安装，避免 default 提高核心 certifi 版本要求。
+yt-dlp==2026.10.21
+yt-dlp-ejs==0.8.0
+pycryptodomex
+brotli; implementation_name == "cpython" and sys_platform != "ios"
+brotlicffi; implementation_name != "cpython"

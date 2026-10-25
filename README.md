@@ -118,10 +118,12 @@ ffprobe -version
 
 YouTube 完整支持还需安装 [yt-dlp 支持的 JavaScript 运行时](https://github.com/yt-dlp/yt-dlp/wiki/EJS)，默认识别 Deno；Python 依赖已包含 EJS 包。
 
-平台解析失效时，可在 AstrBot 的 Python 环境更新下载器：
+插件按需安装下载依赖，下载器与 EJS 使用配套版本。平台解析失效时，优先通过 AstrBot 插件管理更新本插件。
+
+如需重新安装依赖，在 AstrBot 根目录使用 AstrBot 的 Python 环境执行：
 
 ```sh
-python -m pip install -U "yt-dlp[default]"
+python -m pip install -r data/plugins/astrbot_plugin_vision/requirements.txt
 ```
 
 ### 三类文件分别管理
