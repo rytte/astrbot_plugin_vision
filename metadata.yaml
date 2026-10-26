@@ -1,7 +1,7 @@
 name: astrbot_plugin_vision
 display_name: 视频理解
 desc: 为模型提供混合抽帧视频概览与按需回看工具，让你的 AstrBot 看懂视频。
-version: 1.1.0
+version: 1.1.1
 author: rytte
 astrbot_version: ">=4.27,<5"
 repo: https://github.com/rytte/astrbot_plugin_vision
