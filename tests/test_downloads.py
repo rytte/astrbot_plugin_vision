@@ -101,6 +101,8 @@ def test_wrapped_network_failure_keeps_safe_reason_and_redacts_raw_error():
         ("connection", "网络连接失败或下载中断"),
         ("incomplete", "网络连接失败或下载中断"),
         ("merge", "FFmpeg 处理失败"),
+        ("fresh_cookies", "yt-dlp 提示需要有效的浏览器 Cookie（不一定需要登录）"),
+        ("fresh_cookies_text", "yt-dlp 提示需要有效的浏览器 Cookie（不一定需要登录）"),
         ("unknown", "yt-dlp 无法解析或下载"),
     ],
 )
@@ -109,7 +111,12 @@ def test_download_failure_classifies_wrapped_errors_without_leaking_secrets(
 ):
     from yt_dlp.networking.common import Response
     from yt_dlp.networking.exceptions import HTTPError, SSLError, TransportError
-    from yt_dlp.utils import ContentTooShortError, DownloadError, PostProcessingError
+    from yt_dlp.utils import (
+        ContentTooShortError,
+        DownloadError,
+        ExtractorError,
+        PostProcessingError,
+    )
 
     private = "https://cdn.example/video?sign=secret Cookie=private"
     causes = {
@@ -122,6 +129,11 @@ def test_download_failure_classifies_wrapped_errors_without_leaking_secrets(
         "connection": TransportError(private),
         "incomplete": ContentTooShortError(10, 100),
         "merge": PostProcessingError(private),
+        "fresh_cookies": ExtractorError(
+            f"Fresh cookies (not necessarily logged in) are needed: {private}",
+            expected=True,
+        ),
+        "fresh_cookies_text": DownloadError(f"FRESH COOKIES are needed: {private}"),
         "unknown": DownloadError(private),
     }
     cause = causes[kind]

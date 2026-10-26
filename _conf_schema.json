@@ -68,7 +68,7 @@
       "download_cookie_file": {
         "type": "string",
         "description": "yt-dlp Cookie 文件路径",
-        "hint": "可选，填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径，用于需要登录的平台。",
+        "hint": "可选，填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径。抖音公开视频会自动获取匿名访问凭据，通常无需填写；需要登录或触发风控时可尝试配置有效的浏览器 Cookie。",
         "default": "",
         "condition": {
           "share_links_enabled": true

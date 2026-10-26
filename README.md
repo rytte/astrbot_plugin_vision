@@ -105,9 +105,10 @@ ffprobe -version
 默认开启。开启后插件会从文本、分享卡片、JSON 卡片及引用消息中提取链接，也支持读取 OneBot 原始 XML 卡片里的链接。
 
 * **解析工具**：收到消息时只登记来源，模型调用概览工具后才使用 **yt-dlp** 下载视频。
-* **额外适配**：B 站还支持直接发送 BV 号、av 号，以及省略 `https://` 的 `b23.tv` 短链，插件会自动补成完整链接。
+* **额外适配（B站）**：B 站还支持直接发送 BV 号、av 号，以及省略 `https://` 的 `b23.tv` 短链，插件会自动补成完整链接。
+* **额外适配（抖音）**：自动获取匿名访问凭据、补齐详情请求签名和媒体 Referer，通常无需登录或手动导出 Cookie；仍可能受平台风控限制。
 * **视频下载**：下载优先选择不超过 720p 的画面，没有匹配档位时尝试可用的合成格式；拒绝直播和合集。
-* **登录凭证**：需要登录的平台，可在 **yt-dlp Cookie 文件路径** 配置填写 Netscape 格式 Cookie 文件路径。插件使用临时副本，不修改原文件。
+* **浏览器 Cookie**：在 **yt-dlp Cookie 文件路径** 配置填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径。部分平台即使无需登录也要求有效的浏览器 Cookie。插件使用临时副本，不修改原文件。
 * **下载限制**：下载器不继承系统代理，只接受公开 HTTP/HTTPS 链接，拒绝本机、内网、带账号密码或非标准端口的地址，跳转和媒体请求也会检查 DNS。若本机代理通过 TUN 与 Fake-IP DNS 使用 `198.18.0.0/15`，可开启 **兼容本机代理 Fake-IP DNS**；该选项仅放行域名解析到这一网段的情况，直接 Fake-IP 链接和其他内网地址仍被拒绝。
 
 #### yt-dlp
@@ -115,6 +116,8 @@ ffprobe -version
 [yt-dlp](https://github.com/yt-dlp/yt-dlp/tree/master) 是一个开源视频下载工具，提供 **B 站、A 站、抖音、小红书、微博、YouTube、TikTok、X、Instagram 等平台**的提取器。
 
 具体链接能否下载受登录状态、地区、网络和平台变化影响，不保证快手、微信视频号可用。完整范围见 [yt-dlp 支持站点](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)。
+
+抖音兼容处理参考 [yt-dlp PR #17826](https://github.com/yt-dlp/yt-dlp/pull/17826)，仅在插件下载实例内替换抖音提取器，不修改已安装的 yt-dlp，也不需要安装该 PR 分支。
 
 YouTube 完整支持还需安装 [yt-dlp 支持的 JavaScript 运行时](https://github.com/yt-dlp/yt-dlp/wiki/EJS)，默认识别 Deno；Python 依赖已包含 EJS 包。
 
@@ -160,6 +163,8 @@ python -m pip install -U "yt-dlp[default]"
 **找不到 FFmpeg 或 ffprobe**：检查 AstrBot 所在进程或容器是否能执行两个命令。桌面系统中安装成功，不代表容器或服务进程也能找到；必要时在“基础依赖”中填写绝对路径。
 
 **分享链接下载失败**：先检查链接是否有效、网络是否可达、平台是否要求登录，再检查 Cookie、yt-dlp 版本和 YouTube 的 JavaScript 运行时。使用 Fake-IP DNS 时按前文启用兼容；也可以直接发送视频附件。
+
+**抖音解析失败或提示 Fresh cookies**：公开视频会先自动补齐匿名访问凭据与签名。失败可能来自平台风控、视频不可用或签名规则变化，不能仅凭 Fresh cookies 判断 Cookie 过期。先检查链接、更新插件和 yt-dlp；仍失败时，可在浏览器打开视频并完成平台验证，再导出 Netscape 格式 Cookie 文件，填写到 **yt-dlp Cookie 文件路径**，或直接发送视频附件。
 
 **模型报图片过多、上下文过长或超时**：降低概览帧数预算、增加采样间隔或减小单帧尺寸；也可尝试九宫格或单独看图模型。转述会把视觉开销交给所选模型，同时增加文字输入，不保证总费用更低或速度更快。
 

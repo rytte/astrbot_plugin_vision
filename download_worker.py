@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
 import re
 import socket
 import sys
+import time
+import uuid
 from pathlib import Path
+from urllib.parse import urlencode
 
 
 class DownloadRejected(ValueError):
@@ -117,6 +121,11 @@ def download_failure(error: Exception, stage: str = "") -> str:
         return prefix + "网络连接失败或下载中断，请稍后重试并检查网络或代理"
     if any(isinstance(current, PostProcessingError) for current in errors):
         return prefix + "FFmpeg 处理失败，请检查 FFmpeg 配置及下载文件是否完整"
+    if any("fresh cookies" in str(current).lower() for current in errors):
+        return prefix + (
+            "yt-dlp 提示需要有效的浏览器 Cookie（不一定需要登录）；也可能是平台风控或签名适配失效，"
+            "请更新插件和 yt-dlp，必要时配置“yt-dlp Cookie 文件路径”"
+        )
     return prefix + (
         "yt-dlp 无法解析或下载该视频；可能需要登录、链接已失效、网络受限或平台暂不支持"
     )
@@ -154,6 +163,89 @@ def validate_info(info: dict, max_duration: float, max_bytes: int) -> None:
             "http_dash_segments",
         }:
             raise DownloadRejected("该视频的下载协议暂不支持")
+
+
+def register_douyin_extractor(ydl) -> None:
+    """在当前下载实例中补齐抖音匿名会话与 WebSign，不修改 yt-dlp 安装文件。"""
+    from yt_dlp.extractor.tiktok import DouyinIE as BaseDouyinIE
+
+    # 请求流程参考 https://github.com/yt-dlp/yt-dlp/pull/17826 。
+    # 使用相同的提取器键覆盖内置实现，短链经 Generic 跳转后也走这里。
+    class DouyinIE(BaseDouyinIE):
+        def _visitor_id(self) -> str:
+            cookies = self._get_cookies(self._WEBPAGE_HOST)
+            for name in (
+                "UIFID",
+                "UIFID_TEMP",
+                "UIFIDTEMP",
+                "uifid",
+                "uifid_temp",
+                "uifidtemp",
+            ):
+                if cookie := cookies.get(name):
+                    if cookie.value:
+                        return cookie.value
+            response = self._request_webpage(self._WEBPAGE_HOST, None)
+            visitor = response.headers.get("x-tt-trace-host")
+            if not visitor:
+                raise DownloadRejected(
+                    "抖音未返回可用访客标识；可能触发平台风控，请稍后重试或配置有效的浏览器 Cookie"
+                )
+            return visitor
+
+        def _real_extract(self, url):
+            video_id = self._match_id(url)
+            cookies = self._get_cookies(self._WEBPAGE_HOST)
+            # 保留管理员提供的 Cookie，只在缺少匿名访问凭据时补齐。
+            if not cookies.get("passport_csrf_token"):
+                self._set_cookie(".douyin.com", "passport_csrf_token", uuid.uuid4().hex)
+            if not cookies.get("ttwid"):
+                self._request_webpage(
+                    self._WEBPAGE_HOST + "ttwid/register",
+                    None,
+                    data=json.dumps(
+                        {"aid": 6383, "service": "www.douyin.com"}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                if not self._get_cookies(self._WEBPAGE_HOST).get("ttwid"):
+                    raise DownloadRejected(
+                        "抖音未返回匿名访问 Cookie；可能触发平台风控，请稍后重试或配置有效的浏览器 Cookie"
+                    )
+            visitor = self._visitor_id()
+            timestamp = str(int(time.time()))
+            query = {
+                "aweme_id": video_id,
+                "aid": 6383,
+                "uifid": visitor,
+                "timestamp": timestamp,
+            }
+            # 签名覆盖最终发送的 query 字节，参数顺序及编码必须一致。
+            query["x-secsdk-web-signature"] = hashlib.md5(
+                f"{visitor}_{timestamp}_A96D855A08C0A9707F8BEF0D9A527E4E_{urlencode(query)}".encode()
+            ).hexdigest()
+            response = self._download_json(
+                self._WEBPAGE_HOST + "aweme/v1/web/aweme/detail/",
+                video_id,
+                note="Downloading web detail JSON",
+                query=query,
+            )
+            detail = (
+                response.get("aweme_detail") if isinstance(response, dict) else None
+            )
+            if not isinstance(detail, dict) or not detail:
+                raise DownloadRejected(
+                    "抖音未返回视频详情；可能是视频不可用、平台风控或签名规则变化，"
+                    "请检查链接并尝试更新插件或配置浏览器 Cookie"
+                )
+            info = self._parse_aweme_video_app(detail)
+            info["http_headers"] = {
+                **info.get("http_headers", {}),
+                "Referer": self._WEBPAGE_HOST,
+            }
+            return info
+
+    ydl.add_info_extractor(DouyinIE())
 
 
 def download(config: dict) -> None:
@@ -246,6 +338,7 @@ def download(config: dict) -> None:
             for name in list(director.handlers):
                 if name != "Urllib":
                     director.handlers.pop(name).close()
+            register_douyin_extractor(ydl)
             info = ydl.extract_info(config["url"], download=False)
             if not info:
                 raise DownloadRejected("未找到可下载的视频")
