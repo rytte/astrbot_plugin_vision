@@ -1,0 +1,288 @@
+import asyncio
+import time
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from astrbot.api.event import AstrMessageEvent
+from astrbot.api.message_components import Plain
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.platform.message_type import MessageType
+from astrbot.core.platform.platform_metadata import PlatformMetadata
+from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.star.filter.command import CommandFilter
+from astrbot_plugin_vision.live import decode_frame
+from astrbot_plugin_vision.live_reply import LiveReplyRoute
+from astrbot_plugin_vision.main import VisionPlugin
+from test_live import picture
+from test_plugin import plugin as plugin  # 复用已有插件夹具。
+
+
+class PlatformEvent(AstrMessageEvent):
+    def __init__(self):
+        message = AstrBotMessage()
+        message.type = MessageType.FRIEND_MESSAGE
+        message.session_id = "alice"
+        message.sender = MessageMember(user_id="alice", nickname="Alice")
+        message.self_id = "bot"
+        message.message_id = "original-command"
+        message.message_str = "/live 屏幕 变化触发 一起看"
+        message.message = [Plain(text=message.message_str)]
+        message.raw_message = {"command": "original"}
+        super().__init__(
+            message.message_str,
+            message,
+            PlatformMetadata(name="test", description="test", id="test"),
+            "alice",
+        )
+        self.role = "admin"
+        self.transport_client = object()
+        self.sent = []
+
+    async def send(self, message):
+        self.sent.append(message)
+        await super().send(message)
+
+
+async def collect(generator):
+    return [item async for item in generator]
+
+
+async def test_command_starts_direct_capture_and_end_cancels(plugin, monkeypatch):
+    plugin.settings = replace(
+        plugin.settings,
+        live_enabled=True,
+        live_sensitivity="high",
+        live_observation_interval=20,
+    )
+    plugin.live_sessions.settings = plugin.settings
+    started = asyncio.Event()
+
+    async def capture(sessions, session, ffmpeg):
+        await sessions.add_frame(session, picture(), 0)
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("astrbot_plugin_vision.main.read_capture", capture)
+    event = PlatformEvent()
+    results = await collect(
+        plugin.live_command(event, "屏幕 变化触发 keep watching with me")
+    )
+    assert "已开始" in results[0].get_plain_text()
+    assert started.is_set()
+    session = plugin.live_sessions.for_chat(event.unified_msg_origin, "alice")
+    assert session.options.focus == "keep watching with me"
+    assert session.options.sensitivity == "high"
+    assert session.options.interval == 20
+    assert session.options.proactive
+    results = await collect(plugin.live_command(event, "end"))
+    assert "已结束" in results[0].get_plain_text()
+    assert session.stream_task.cancelled()
+    assert session.reply_route is None
+
+
+async def test_command_parser_keeps_entire_observation_instruction():
+    handler = SimpleNamespace(handler=VisionPlugin.live_command)
+    command = CommandFilter("live", handler_md=handler)
+    params = command.validate_and_convert_params(
+        ["屏幕", "变化触发", "keep", "watching", "with", "me"], command.handler_params
+    )
+    assert params["arguments"] == "屏幕 变化触发 keep watching with me"
+
+
+async def test_failed_capture_cleans_session_and_non_admin_cannot_start(
+    plugin, monkeypatch
+):
+    plugin.settings = replace(plugin.settings, live_enabled=True)
+    event = PlatformEvent()
+    event.role = "member"
+    results = await collect(plugin.live_command(event, "屏幕 变化 一起看"))
+    assert "管理员" in results[0].get_plain_text()
+    assert not plugin.live_sessions.sessions
+    event.role = "admin"
+
+    async def fail(sessions, session, ffmpeg):
+        session.error = "设备无权限"
+        session.ready.set()
+
+    monkeypatch.setattr("astrbot_plugin_vision.main.read_capture", fail)
+    results = await collect(plugin.live_command(event, "屏幕 变化 一起看"))
+    assert "设备无权限" in results[0].get_plain_text()
+    assert not plugin.live_sessions.sessions
+
+
+async def test_reply_enters_normal_pipeline_with_current_conversation(plugin):
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {})
+    session.frames.append(decode_frame(picture(), 0, 160))
+    session.observed_received = time.monotonic()
+    session.observation = {"summary": "有人摔倒"}
+    session.reply_route = LiveReplyRoute.from_event(original)
+    queue = asyncio.Queue()
+    plugin.context.get_event_queue = lambda: queue
+    conversation = SimpleNamespace(history="[]")
+    plugin.context.conversation_manager = SimpleNamespace(
+        get_curr_conversation_id=AsyncMock(return_value="cid"),
+        get_conversation=AsyncMock(return_value=conversation),
+    )
+    try:
+        await plugin._speak_live(session, "值得吐槽", session.user_generation)
+        event = queue.get_nowait()
+        assert isinstance(event, PlatformEvent)
+        assert event is not original
+        assert event.transport_client is original.transport_client
+        assert event.message_obj.raw_message is None
+        assert event.get_extra("vision_agent_context") is None
+        assert event.get_extra("enable_streaming") is False
+        assert not original.get_extra("vision_live_reply")
+        results = await collect(plugin.live_reply(event))
+        assert results[0].conversation is conversation
+        assert "值得吐槽" in results[0].prompt
+        assert session.id not in results[0].prompt
+        plugin.context.llm_generate.assert_not_awaited()
+        await plugin.bind_agent_context(event, SimpleNamespace(messages=[]))
+        assert session.user_busy == 0
+        response = LLMResponse(role="assistant", completion_text="[SILENT]")
+        await plugin.validate_live_reply_response(event, response)
+        assert event.is_stopped()
+        assert response.completion_text == ""
+        event = session.reply_route.create(event.get_extra("vision_live_reply"))
+        plugin.live_sessions.user_turn(session)
+        await plugin.validate_live_reply_request(event, None)
+        assert event.is_stopped()
+    finally:
+        await plugin.live_sessions.close()
+
+
+@pytest.mark.parametrize(
+    "evidence_age,reply_age,valid",
+    [(21, 0, True), (45, 24, True), (91, 1, False), (60, 46, False)],
+)
+async def test_reply_freshness_allows_model_latency(
+    plugin, evidence_age, reply_age, valid
+):
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {})
+    session.frames.append(decode_frame(picture(), 0, 160))
+    now = time.monotonic()
+    payload = {
+        "session_id": session.id,
+        "generation": session.generation,
+        "user_generation": session.user_generation,
+        "observed_received": now - evidence_age,
+        "created_at": now - reply_age,
+    }
+    try:
+        assert plugin._live_reply_valid(payload) is valid
+        session.frames[-1] = replace(session.frames[-1], received=time.monotonic() - 11)
+        assert not plugin._live_reply_valid(payload)
+    finally:
+        await plugin.live_sessions.close()
+
+
+@pytest.mark.parametrize("evidence_age,reply_age", [(0, 0), (45, 24)])
+async def test_live_reply_uses_core_decorate_and_respond_stages(
+    plugin, monkeypatch, evidence_age, reply_age
+):
+    import copy
+
+    from astrbot.core.config.default import DEFAULT_CONFIG
+    from astrbot.core.message.message_event_result import ResultContentType
+    from astrbot.core.pipeline.respond.stage import RespondStage
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+    from astrbot.core.star.star_handler import EventType
+
+    monkeypatch.setattr(
+        "astrbot.core.platform.astr_message_event.Metric.upload", AsyncMock()
+    )
+
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {})
+    session.frames.append(decode_frame(picture(), 0, 160))
+    session.observed_received = time.monotonic()
+    session.observation = {"summary": "新的事件"}
+    route = LiveReplyRoute.from_event(original)
+    event = route.create(
+        {
+            "session_id": session.id,
+            "generation": session.generation,
+            "user_generation": session.user_generation,
+            "observed_received": session.observed_received,
+            "created_at": time.monotonic() - reply_age,
+        }
+    )
+    event.get_extra("vision_live_reply")["observed_received"] -= evidence_age
+    event.set_result(
+        event.plain_result("正常评论").set_result_content_type(
+            ResultContentType.LLM_RESULT
+        )
+    )
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["platform_settings"]["reply_prefix"] = "陪看："
+    config["platform_settings"]["reply_with_mention"] = False
+    config["platform_settings"]["reply_with_quote"] = False
+    config["platform_settings"]["segmented_reply"]["enable"] = False
+    config["provider_tts_settings"]["enable"] = False
+    config["t2i"] = False
+    plugin.context.get_using_tts_provider_async = AsyncMock(return_value=None)
+    ctx = SimpleNamespace(
+        astrbot_config=config, plugin_manager=SimpleNamespace(context=plugin.context)
+    )
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.result_decorate.stage.star_handlers_registry.get_handlers_by_event_type",
+        lambda *args, **kwargs: [],
+    )
+
+    async def remember(sent_event, hook_type, *args, **kwargs):
+        if hook_type == EventType.OnAfterMessageSentEvent:
+            await plugin.remember_live_reply(sent_event)
+        return False
+
+    monkeypatch.setattr("astrbot.core.pipeline.respond.stage.call_event_hook", remember)
+    try:
+        decorate = ResultDecorateStage()
+        await decorate.initialize(ctx)
+        respond = RespondStage()
+        await respond.initialize(ctx)
+        await collect(decorate.process(event))
+        await respond.process(event)
+        assert event.sent[-1].get_plain_text() == "陪看：正常评论"
+        assert session.recent_speech[-1] == "陪看：正常评论"
+        assert event.get_result() is None
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_webchat_reply_uses_existing_adapter_delivery(monkeypatch):
+    from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
+
+    monkeypatch.setattr(
+        "astrbot.core.platform.astr_message_event.Metric.upload", AsyncMock()
+    )
+    original = PlatformEvent()
+    original.platform_meta.name = "webchat"
+    event = WebChatMessageEvent(
+        original.message_str,
+        original.message_obj,
+        original.platform_meta,
+        original.session_id,
+    )
+    sender = AsyncMock()
+    adapter = SimpleNamespace(
+        meta=lambda: original.platform_meta, send_by_session=sender
+    )
+    context = SimpleNamespace(
+        platform_manager=SimpleNamespace(platform_insts=[adapter])
+    )
+    route = LiveReplyRoute.from_event(event, context)
+    reply = route.create({"session_id": "live"})
+    await reply.send(reply.plain_result("通过平台原有发送方式"))
+    sender.assert_awaited_once()
+    assert sender.await_args.args[0] == reply.session
+    assert sender.await_args.args[1].get_plain_text() == "通过平台原有发送方式"
+    await reply.send(None)
+    assert sender.await_count == 1

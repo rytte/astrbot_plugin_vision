@@ -28,6 +28,20 @@ CONFIG_GROUPS = {
         "scene_threshold",
     ),
     "inspect": ("inspect_max_frames", "inspect_max_edge", "inspect_max_calls"),
+    "live": (
+        "live_enabled",
+        "live_max_edge",
+        "live_sensitivity",
+        "live_observation_interval",
+        "live_interval_proactive",
+        "live_camera_device",
+        "live_audio_device",
+        "live_buffer_seconds",
+        "live_session_seconds",
+        "live_min_analysis_interval",
+        "live_speech_cooldown",
+        "live_max_analyses",
+    ),
     "runtime_cache": (
         "max_edge_limit",
         "tool_timeout",
@@ -63,6 +77,18 @@ class Settings:
     inspect_max_edge: int = 768
     max_edge_limit: int = 1280
     inspect_max_calls: int = 3
+    live_enabled: bool = False
+    live_max_edge: int = 1280
+    live_sensitivity: str = "medium"
+    live_observation_interval: float = 10.0
+    live_interval_proactive: bool = True
+    live_camera_device: str = ""
+    live_audio_device: str = ""
+    live_buffer_seconds: float = 60.0
+    live_session_seconds: float = 1800.0
+    live_min_analysis_interval: float = 5.0
+    live_speech_cooldown: float = 15.0
+    live_max_analyses: int = 120
     tool_timeout: float = 300.0
     max_concurrency: int = 2
     cache_ttl: float = 3600.0
@@ -72,6 +98,16 @@ class Settings:
     def from_mapping(cls, values: Mapping) -> Settings:
         defaults = cls()
         values = dict(values)
+        # 开发版采集网页配置已移除，兼容升级时遗留的配置项。
+        removed_live = {"live_host", "live_port", "live_public_url", "live_stream_url"}
+        if isinstance(values.get("live"), Mapping):
+            values["live"] = {
+                key: value
+                for key, value in values["live"].items()
+                if key not in removed_live
+            }
+        for key in removed_live:
+            values.pop(key, None)
         for group, keys in CONFIG_GROUPS.items():
             if group not in values:
                 continue
@@ -130,4 +166,18 @@ class Settings:
             raise ValueError("默认图片长边必须在 64 与 max_edge_limit 之间")
         if settings.inspect_max_frames > 32 or settings.max_concurrency > 8:
             raise ValueError("单次回看最多 32 帧，并发数最多 8")
+        if not 64 <= settings.live_max_edge <= 4096:
+            raise ValueError("live_max_edge 必须在 64～4096 之间")
+        if settings.live_min_analysis_interval > 300:
+            raise ValueError("live_min_analysis_interval 最多300秒")
+        if (
+            not settings.live_min_analysis_interval
+            <= settings.live_observation_interval
+            <= 300
+        ):
+            raise ValueError("实时观察间隔不能小于分析最短间隔，且最多300秒")
+        if settings.live_sensitivity not in {"low", "medium", "high"}:
+            raise ValueError("实时变化灵敏度必须是 low、medium 或 high")
+        if settings.live_buffer_seconds > 300 or settings.live_session_seconds > 14400:
+            raise ValueError("实时缓冲最多 300 秒，单次会话最多 4 小时")
         return settings

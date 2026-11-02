@@ -399,7 +399,7 @@ async def test_unauthorized_video_never_calls_asr(plugin, audio_video, asr_provi
     asr_provider.get_text.assert_not_awaited()
 
 
-async def test_plugin_details_list_both_model_tools_without_instantiation():
+async def test_plugin_details_list_all_model_tools_without_instantiation():
     # 插件未实例化（例如启动时已禁用）时，详情页仍应列出完整工具。
     handlers = star_handlers_registry.get_handlers_by_module_name(
         VisionPlugin.__module__
@@ -409,11 +409,55 @@ async def test_plugin_details_list_both_model_tools_without_instantiation():
         [handler.handler_full_name for handler in handlers]
     )
     tools = [component for component in components if component["type"] == "llm_tool"]
-    assert len(tools) == 2
-    assert {tool["name"] for tool in tools} == {"video_overview", "video_inspect"}
+    assert len(tools) == 3
+    assert {tool["name"] for tool in tools} == {
+        "video_overview",
+        "video_inspect",
+        "live_observe",
+    }
     assert all(
         tool["description"] and tool["description"] != "无描述" for tool in tools
     )
+
+
+async def test_live_observe_is_bound_to_sender_and_current_chat(plugin, tmp_path):
+    plugin.context.get_current_chat_provider_id = AsyncMock(return_value="chat-model")
+    plugin.context.llm_generate.return_value = SimpleNamespace(
+        completion_text=json.dumps(
+            {"summary": "0秒，红色画面", "memory": "红色", "speak": False}
+        )
+    )
+    session = await plugin.live_sessions.create("chat", "alice")
+    plugin.live_sessions.configure(session, {"mode": "demand"})
+    picture = tmp_path / "live.jpg"
+    Image.new("RGB", (80, 60), "red").save(picture)
+    await plugin.live_sessions.add_frame(session, picture.read_bytes(), 0)
+    try:
+        assert (await plugin.live_observe(Event(user="bob"))).isError
+        assert (await plugin.live_observe(Event(origin="other"))).isError
+        result = await plugin.live_observe(Event(), "什么颜色")
+        assert not result.isError
+        assert data(result)["summary"] == "0秒，红色画面"
+        request = plugin.context.llm_generate.call_args.kwargs
+        assert request["chat_provider_id"] == "chat-model"
+        assert request["image_urls"][0].startswith("data:image/jpeg;base64,")
+        assert request["tools"] is None
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_live_agent_lifecycle_suppresses_background_speech(plugin):
+    session = await plugin.live_sessions.create("chat", "alice")
+    event = Event()
+    try:
+        await plugin.bind_agent_context(event, event.agent_context)
+        assert session.user_busy == 1
+        generation = session.user_generation
+        await plugin.release_agent_context(event, event.agent_context, None)
+        assert session.user_busy == 0
+        assert session.user_generation > generation
+    finally:
+        await plugin.live_sessions.close()
 
 
 def test_registered_tools_have_provider_compatible_schema(plugin):
