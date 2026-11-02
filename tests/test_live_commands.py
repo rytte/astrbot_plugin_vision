@@ -32,7 +32,7 @@ class PlatformEvent(AstrMessageEvent):
         message.sender = MessageMember(user_id="alice", nickname="Alice")
         message.self_id = "bot"
         message.message_id = "original-command"
-        message.message_str = "/live 屏幕 变化触发 一起看"
+        message.message_str = "/live 屏幕 变化 一起看"
         message.message = [Plain(text=message.message_str)]
         message.raw_message = {"command": "original"}
         super().__init__(
@@ -54,7 +54,12 @@ async def collect(generator):
     return [item async for item in generator]
 
 
-async def test_command_starts_direct_capture_and_end_cancels(plugin, monkeypatch):
+@pytest.mark.parametrize(
+    "mode,expected", [("提问", "demand"), ("定时", "interval"), ("变化", "change")]
+)
+async def test_command_starts_direct_capture_and_end_cancels(
+    plugin, monkeypatch, mode, expected
+):
     plugin.settings = replace(
         plugin.settings,
         live_enabled=True,
@@ -72,15 +77,17 @@ async def test_command_starts_direct_capture_and_end_cancels(plugin, monkeypatch
     monkeypatch.setattr("astrbot_plugin_vision.main.read_capture", capture)
     event = PlatformEvent()
     results = await collect(
-        plugin.live_command(event, "屏幕 变化触发 keep watching with me")
+        plugin.live_command(event, f"屏幕 {mode} keep watching with me")
     )
     assert "已开始" in results[0].get_plain_text()
+    assert f"响应模式：{mode}" in results[0].get_plain_text()
     assert started.is_set()
     session = plugin.live_sessions.for_chat(event.unified_msg_origin, "alice")
     assert session.options.focus == "keep watching with me"
     assert session.options.sensitivity == "high"
     assert session.options.interval == 20
-    assert session.options.proactive
+    assert session.options.mode == expected
+    assert session.options.proactive is (mode != "提问")
     results = await collect(plugin.live_command(event, "end"))
     assert "已结束" in results[0].get_plain_text()
     assert session.stream_task.cancelled()
@@ -91,9 +98,9 @@ async def test_command_parser_keeps_entire_observation_instruction():
     handler = SimpleNamespace(handler=VisionPlugin.live_command)
     command = CommandFilter("live", handler_md=handler)
     params = command.validate_and_convert_params(
-        ["屏幕", "变化触发", "keep", "watching", "with", "me"], command.handler_params
+        ["屏幕", "提问", "keep", "watching", "with", "me"], command.handler_params
     )
-    assert params["arguments"] == "屏幕 变化触发 keep watching with me"
+    assert params["arguments"] == "屏幕 提问 keep watching with me"
 
 
 async def test_failed_capture_cleans_session_and_non_admin_cannot_start(

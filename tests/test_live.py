@@ -474,9 +474,7 @@ def test_command_uses_configuration_and_preserves_instruction(source, expected):
         asr_provider_id="existing-asr",
         live_interval_proactive=False,
     )
-    options, url = parse_live_command(
-        source + " 定时观察 look at this，不要剧透", settings
-    )
+    options, url = parse_live_command(source + " 定时 look at this，不要剧透", settings)
     assert options["source"] == expected
     assert options["focus"] == "look at this，不要剧透"
     assert options["interval"] == 20
@@ -495,6 +493,13 @@ def test_command_uses_configuration_and_preserves_instruction(source, expected):
         "file:///etc/passwd 变化 观察",
         "https:// 变化 观察",
         "屏幕 不存在 观察",
+        "屏幕 按需 观察",
+        "屏幕 按需取帧 观察",
+        "屏幕 定时观察 观察",
+        "屏幕 变化触发 观察",
+        "屏幕 demand 观察",
+        "屏幕 interval 观察",
+        "屏幕 change 观察",
     ],
 )
 def test_invalid_live_command_rejected(command):

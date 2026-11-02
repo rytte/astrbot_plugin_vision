@@ -92,7 +92,7 @@
       "overview_model_enabled": {
         "type": "bool",
         "description": "启用视频看图模型",
-        "hint": "开启并选择模型后，概览、回看和实时视觉由该模型看图，主模型接收转述文字。关闭或未选择时图片直接进入主对话；实时定时观察关闭主动发言时，后台仍单独生成静默摘要。",
+        "hint": "开启并选择模型后，概览、回看和实时视觉由该模型看图，主模型接收转述文字。关闭或未选择时图片直接进入主对话；实时视觉的定时模式关闭主动发言时，后台仍单独生成静默摘要。",
         "default": false
       },
       "overview_provider_id": {
@@ -195,7 +195,7 @@
         "type": "bool",
         "description": "启用实时视觉",
         "default": false,
-        "hint": "管理员使用 /live 屏幕|摄像头|媒体URL 工作模式 观察指令 启动，/live end 结束。直接采集 AstrBot 宿主设备。"
+        "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。直接采集 AstrBot 宿主设备。"
       },
       "live_max_edge": {
         "type": "int",
@@ -215,14 +215,14 @@
           "medium",
           "high"
         ],
-        "hint": "low低、medium中、high高；本地RGB差异触发观察，再由模型判断是否评论。",
+        "hint": "low低、medium中、high高；本地RGB差异决定是否观察，再由模型判断是否评论。",
         "condition": {
           "live_enabled": true
         }
       },
       "live_observation_interval": {
         "type": "float",
-        "description": "定时观察间隔（秒）",
+        "description": "定时模式观察间隔（秒）",
         "default": 10,
         "hint": "不小于后台分析最短间隔，最多300秒。",
         "condition": {
@@ -231,9 +231,9 @@
       },
       "live_interval_proactive": {
         "type": "bool",
-        "description": "定时观察允许主动发言",
+        "description": "定时模式允许主动发言",
         "default": true,
-        "hint": "仅定时观察使用；按需只回答用户，变化触发允许主动评论。",
+        "hint": "仅定时模式使用；提问模式只回答用户，变化模式允许主动评论。定时和变化模式会自动观察，需要回应时才发言。",
         "condition": {
           "live_enabled": true
         }

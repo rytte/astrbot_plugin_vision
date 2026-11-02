@@ -32,6 +32,7 @@ from .downloads import VideoDownloads
 from .live import (
     COMMENT_MAX_AGE_SECONDS,
     LIVE_USAGE,
+    MODE_LABELS,
     REPLY_TIMEOUT_SECONDS,
     LiveSessions,
     image_url,
@@ -692,7 +693,7 @@ class VisionPlugin(Star):
 
     @filter.command("live")
     async def live_command(self, event: AstrMessageEvent, arguments: GreedyStr):
-        """live <屏幕|摄像头|URL> <按需取帧|定时观察|变化触发> <观察指令>；live end 结束。"""
+        """live <来源> <响应模式> <观察指令>；来源：屏幕/摄像头/URL；响应模式：提问/定时/变化；live end 结束。"""
         origin, user = self._owner(event)
         if arguments.strip().lower() == "end":
             session = self.live_sessions.for_chat(origin, user)
@@ -746,7 +747,7 @@ class VisionPlugin(Star):
             }[options["source"]]
             audio = "复用已配置ASR" if options["audio"] else "未启用ASR，仅分析画面"
             yield event.plain_result(
-                f"已开始观察{source_name}，模式：{arguments.split()[1]}；{audio}。使用 /live end 结束。"
+                f"已开始观察{source_name}，响应模式：{MODE_LABELS[options['mode']]}；{audio}。使用 /live end 结束。"
             )
         except asyncio.CancelledError:
             if session:
@@ -987,7 +988,7 @@ class VisionPlugin(Star):
             session = self.live_sessions.for_chat(*self._owner(event))
             if session is None:
                 raise VideoError(
-                    "请先在当前聊天使用 /live <屏幕|摄像头|URL> <工作模式> <观察指令>"
+                    "请先在当前聊天使用 /live <屏幕|摄像头|URL> <响应模式：提问|定时|变化> <观察指令>"
                 )
             lookback = number(
                 lookback_sec, "回看秒数", 1, min(60, self.settings.live_buffer_seconds)

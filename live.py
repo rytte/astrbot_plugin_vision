@@ -36,19 +36,17 @@ COMMENT_MAX_AGE_SECONDS = MODEL_TIMEOUT_SECONDS + REPLY_TIMEOUT_SECONDS
 logger = logging.getLogger("astrbot")
 
 MODE_NAMES = {
-    "按需": "demand",
-    "按需取帧": "demand",
-    "demand": "demand",
+    "提问": "demand",
     "定时": "interval",
-    "定时观察": "interval",
-    "interval": "interval",
     "变化": "change",
-    "变化触发": "change",
-    "change": "change",
 }
+MODE_LABELS = {"demand": "提问", "interval": "定时", "change": "变化"}
 LIVE_USAGE = (
-    "用法：/live <屏幕|摄像头|媒体URL> <按需取帧|定时观察|变化触发> <观察指令>\n"
-    "例如：/live 屏幕 变化触发 一起看视频，有意思时简短吐槽\n"
+    "用法：/live <来源> <响应模式> <观察指令>\n"
+    "来源：屏幕 / 摄像头 / 媒体URL\n"
+    "响应模式：提问 / 定时 / 变化\n"
+    "定时和变化模式会自动观察，需要回应时才发言。\n"
+    "例如：/live 屏幕 变化 一起看视频，有意思时简短吐槽\n"
     "结束：/live end"
 )
 
@@ -129,7 +127,7 @@ class LiveOptions:
             "interval",
             "change",
         ):
-            raise ValueError("来源或工作模式无效")
+            raise ValueError("来源或响应模式无效")
         if type(data["audio"]) is not bool or type(data["proactive"]) is not bool:
             raise ValueError("音频和主动发言开关必须是布尔值")
         data["proactive"] = data["mode"] == "change" or (
