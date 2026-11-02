@@ -31,7 +31,7 @@ def picture(color="white", size=(320, 180)):
 @pytest.fixture
 async def live(tmp_path):
     manager = LiveSessions(
-        Settings(),
+        Settings(overview_model_enabled=True, overview_provider_id="vision"),
         tmp_path / "live",
         AsyncMock(
             return_value={
@@ -97,6 +97,50 @@ async def test_live_resolution_reaches_buffer_and_model(live, mode, max_edge):
     frames = live.analyze.await_args.args[1]
     with Image.open(io.BytesIO(frames[-1].jpeg)) as image:
         assert image.size == expected
+
+
+@pytest.mark.parametrize("mode", ["change", "interval"])
+async def test_direct_background_passes_frames_without_observer_call(live, mode):
+    live.settings = replace(
+        live.settings, overview_model_enabled=False, overview_provider_id=""
+    )
+    session = await setup_session(live, mode=mode)
+    session.last_user = -float("inf")
+    await push(live, session, 0, "red")
+    session.transcripts.append({"start_sec": 0, "end_sec": 1, "text": "注意刚才的红色"})
+    result = await live.observe(session, automatic=True)
+    live.analyze.assert_not_awaited()
+    live.speak.assert_awaited_once()
+    assert live.speak.await_args.kwargs["image_urls"] == result["image_urls"]
+    assert result["mode"] == "direct"
+    assert result["audio"][0]["text"] == "注意刚才的红色"
+    assert "image_urls" not in session.observation
+    assert not session.reasons
+
+
+async def test_direct_background_keeps_changes_while_cooling_down(live):
+    live.settings = replace(live.settings, overview_model_enabled=False)
+    session = await setup_session(live)
+    session.last_user = -float("inf")
+    session.last_speech = time.monotonic()
+    await push(live, session, 0, "red")
+    assert await live.observe(session, automatic=True) == {}
+    assert session.reasons == {"initial"}
+    assert session.analysis_count == 0
+    live.analyze.assert_not_awaited()
+    live.speak.assert_not_awaited()
+
+
+async def test_direct_setting_still_updates_silent_interval_summary(live):
+    live.settings = replace(live.settings, overview_model_enabled=False)
+    session = await setup_session(live, mode="interval", proactive=False)
+    session.last_user = -float("inf")
+    await push(live, session, 0, "red")
+    result = await live.observe(session, automatic=True)
+    assert result["summary"] == "出现新的画面"
+    assert "image_urls" not in result
+    live.analyze.assert_awaited_once()
+    live.speak.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

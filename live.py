@@ -230,6 +230,7 @@ class LiveSession:
     user_busy: int = 0
     source_url: str = ""
     reply_route: object | None = None
+    pending_reply: dict | None = None
     ready: asyncio.Event = field(default_factory=asyncio.Event)
 
     @property
@@ -425,6 +426,7 @@ class LiveSessions:
     def pause(self, session: LiveSession, paused: bool) -> None:
         session.paused = paused
         session.generation += 1
+        self.cancel_reply(session)
         session.reasons.clear()
         session.audio_chunks.clear()
         if not paused:
@@ -436,6 +438,13 @@ class LiveSessions:
     def user_turn(self, session: LiveSession) -> None:
         session.last_user = time.monotonic()
         session.user_generation += 1
+        self.cancel_reply(session)
+
+    def cancel_reply(self, session: LiveSession) -> None:
+        if session.pending_reply is not None:
+            session.pending_reply["cancelled"] = True
+            session.pending_reply.pop("image_urls", None)
+            session.pending_reply = None
 
     def snapshot(self, session: LiveSession) -> dict:
         return {
@@ -474,11 +483,14 @@ class LiveSessions:
         lookback: float = 12,
         *,
         automatic: bool = False,
+        direct: bool | None = None,
     ) -> dict:
         task = asyncio.current_task()
         session.operations.add(task)
         try:
-            return await self._observe(session, question, lookback, automatic=automatic)
+            return await self._observe(
+                session, question, lookback, automatic=automatic, direct=direct
+            )
         finally:
             session.operations.discard(task)
 
@@ -489,6 +501,7 @@ class LiveSessions:
         lookback: float = 12,
         *,
         automatic: bool = False,
+        direct: bool | None = None,
     ) -> dict:
         async with session.lock:
             if (
@@ -500,6 +513,26 @@ class LiveSessions:
                 raise VideoError(
                     "实时画面已暂停、断开或超过 10 秒未更新，不能作为当前画面"
                 )
+            options = session.options
+            if options is None:
+                raise VideoError("请先使用 /live 开始观察")
+            if direct is None:
+                direct = not (
+                    self.settings.overview_model_enabled
+                    and self.settings.overview_provider_id
+                ) and (not automatic or options.proactive)
+            if (
+                automatic
+                and direct
+                and (
+                    session.user_busy
+                    or time.monotonic() - session.last_user < 5
+                    or time.monotonic() - session.last_speech
+                    < self.settings.live_speech_cooldown
+                    or session.pending_reply is not None
+                )
+            ):
+                return {}
             if session.analysis_count >= self.settings.live_max_analyses:
                 raise VideoError("本次实时会话的分析预算已用完，请重新开启会话")
             if (
@@ -508,9 +541,6 @@ class LiveSessions:
                 < self.settings.live_min_analysis_interval
             ):
                 return {}
-            options = session.options
-            if options is None:
-                raise VideoError("请先使用 /live 开始观察")
             generation, user_generation = session.generation, session.user_generation
             latest = session.frames[-1]
             candidates = [
@@ -542,10 +572,17 @@ class LiveSessions:
                     session.analysis_count,
                 )
             try:
-                result = await asyncio.wait_for(
-                    self.analyze(session, frames, audio, question, reasons),
-                    min(self.settings.tool_timeout, MODEL_TIMEOUT_SECONDS),
-                )
+                if direct:
+                    result = {
+                        "summary": "本次采样图片直接提供给主模型，未生成独立观察摘要。",
+                        "speak": True,
+                        "comment": "",
+                    }
+                else:
+                    result = await asyncio.wait_for(
+                        self.analyze(session, frames, audio, question, reasons),
+                        min(self.settings.tool_timeout, MODEL_TIMEOUT_SECONDS),
+                    )
                 if (
                     session.stopped
                     or session.paused
@@ -558,8 +595,10 @@ class LiveSessions:
                     raise VideoError("实时看图模型未返回有效分析")
                 session.reference = latest
                 session.observed_received = latest.received
-                session.memory = str(result.get("memory", result["summary"]))[:4000]
+                if not direct:
+                    session.memory = str(result.get("memory", result["summary"]))[:4000]
                 session.observation = {
+                    "mode": "direct" if direct else "delegated",
                     "start_sec": frames[0].timestamp,
                     "end_sec": latest.timestamp,
                     "summary": result["summary"][:4000],
@@ -569,6 +608,7 @@ class LiveSessions:
                     "audio_completed_sec": session.asr_completed_end,
                     "trigger_reasons": reasons,
                 }
+                images = [image_url(frame) for frame in frames] if direct else []
                 session.error = ""
                 comment = result.get("comment", "")
                 now = time.monotonic()
@@ -581,9 +621,11 @@ class LiveSessions:
                     blocked = []
                     if not options.proactive:
                         blocked.append("proactive_disabled")
-                    if result.get("speak") is not True:
+                    if not direct and result.get("speak") is not True:
                         blocked.append("model_silent")
-                    if not isinstance(comment, str) or not comment.strip():
+                    if not direct and (
+                        not isinstance(comment, str) or not comment.strip()
+                    ):
                         blocked.append("empty_candidate")
                     if not timely:
                         blocked.append("evidence_expired")
@@ -595,7 +637,7 @@ class LiveSessions:
                         blocked.append("user_active")
                     if now - session.last_speech < self.settings.live_speech_cooldown:
                         blocked.append("cooldown")
-                    if (
+                    if not direct and (
                         isinstance(comment, str)
                         and comment.strip() in session.recent_speech
                     ):
@@ -607,15 +649,29 @@ class LiveSessions:
                         ",".join(blocked) if blocked else "ready",
                     )
                     if not blocked:
+                        kwargs = {"image_urls": images} if direct else {}
                         await asyncio.wait_for(
-                            self.speak(session, comment.strip()[:500], user_generation),
+                            self.speak(
+                                session,
+                                comment.strip()[:500],
+                                user_generation,
+                                **kwargs,
+                            ),
                             30,
                         )
-                return {
+                observation = {
                     **session.observation,
                     "stale": time.monotonic() - latest.received > FRESH_SECONDS,
                     "memory": session.memory,
                 }
+                if direct:
+                    observation.update(
+                        image_urls=images,
+                        focus=options.focus,
+                        question=question,
+                        recent_comments=list(session.recent_speech),
+                    )
+                return observation
             finally:
                 session.busy = False
 
@@ -635,6 +691,13 @@ class LiveSessions:
                 if session.stale or options.mode == "demand":
                     continue
                 now = time.monotonic()
+                if session.pending_reply is not None:
+                    if (
+                        now - session.pending_reply["created_at"]
+                        < REPLY_TIMEOUT_SECONDS
+                    ):
+                        continue
+                    self.cancel_reply(session)
                 interval = (
                     options.interval
                     if options.mode == "interval"
@@ -673,6 +736,7 @@ class LiveSessions:
             return
         session.stopped = True
         session.generation += 1
+        self.cancel_reply(session)
         self.sessions.pop(session.id, None)
         tasks = [
             task

@@ -92,13 +92,13 @@
       "overview_model_enabled": {
         "type": "bool",
         "description": "启用视频看图模型",
-        "hint": "开启并选择模型后，由该模型分析概览和回看，主模型只接收转述文字。关闭或未选择时由主模型直接看图。",
+        "hint": "开启并选择模型后，概览、回看和实时视觉由该模型看图，主模型接收转述文字。关闭或未选择时图片直接进入主对话；实时定时观察关闭主动发言时，后台仍单独生成静默摘要。",
         "default": false
       },
       "overview_provider_id": {
         "type": "string",
         "description": "视频看图模型",
-        "hint": "选择 AstrBot 已配置且支持图片的模型，用于 video_overview 和 video_inspect。调用失败直接报错，不自动改为主模型看图。",
+        "hint": "选择 AstrBot 已配置且支持图片的模型，用于 video_overview、video_inspect 和实时视觉。调用失败直接报错，不自动改为主模型看图。",
         "default": "",
         "_special": "select_provider",
         "condition": {
@@ -295,7 +295,7 @@
         "type": "int",
         "description": "单会话模型分析次数上限",
         "default": 120,
-        "hint": "独立于离线视频每日额度；包含后台观察和 live_observe，主动发言另有一次主模型调用。",
+        "hint": "独立于离线视频每日额度；包含后台观察和 live_observe。直传时主模型看图并决定回复或沉默；启用独立看图模型时，主动发言还需一次主模型调用。",
         "condition": {
           "live_enabled": true
         }

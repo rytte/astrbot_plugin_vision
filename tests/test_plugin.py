@@ -421,6 +421,12 @@ async def test_plugin_details_list_all_model_tools_without_instantiation():
 
 
 async def test_live_observe_is_bound_to_sender_and_current_chat(plugin, tmp_path):
+    plugin.settings = replace(
+        plugin.settings,
+        overview_model_enabled=True,
+        overview_provider_id="vision-model",
+    )
+    plugin.live_sessions.settings = plugin.settings
     plugin.context.get_current_chat_provider_id = AsyncMock(return_value="chat-model")
     plugin.context.llm_generate.return_value = SimpleNamespace(
         completion_text=json.dumps(
@@ -439,9 +445,48 @@ async def test_live_observe_is_bound_to_sender_and_current_chat(plugin, tmp_path
         assert not result.isError
         assert data(result)["summary"] == "0秒，红色画面"
         request = plugin.context.llm_generate.call_args.kwargs
-        assert request["chat_provider_id"] == "chat-model"
+        assert request["chat_provider_id"] == "vision-model"
         assert request["image_urls"][0].startswith("data:image/jpeg;base64,")
         assert request["tools"] is None
+        assert request["contexts"] == []
+    finally:
+        await plugin.live_sessions.close()
+
+
+@pytest.mark.parametrize(
+    "enabled,provider_id", [(False, ""), (False, "unused-vision"), (True, "")]
+)
+async def test_live_observe_direct_mode_sends_images_to_main_agent(
+    plugin, tmp_path, enabled, provider_id
+):
+    plugin.settings = replace(
+        plugin.settings,
+        overview_model_enabled=enabled,
+        overview_provider_id=provider_id,
+    )
+    plugin.live_sessions.settings = plugin.settings
+    session = await plugin.live_sessions.create("chat", "alice")
+    plugin.live_sessions.configure(session, {"mode": "demand"})
+    picture = tmp_path / "live.jpg"
+    Image.new("RGB", (80, 60), "red").save(picture)
+    await plugin.live_sessions.add_frame(session, picture.read_bytes(), 0)
+    event = Event()
+    try:
+        result = await plugin.live_observe(event, "刚才是什么颜色？")
+        assert not result.isError
+        assert data(result)["mode"] == "direct"
+        assert data(result)["submitted_image_count"] == 1
+        plugin.context.llm_generate.assert_not_awaited()
+        assert isinstance(event.agent_context.messages, ToolImageBuffer)
+        record_tool_result(event, "live_observe", result)
+        images = image_parts(event)
+        assert len(images) == 1
+        assert images[0]._no_save
+        assert images[0].image_url.url.startswith("data:image/jpeg;base64,")
+        metadata = image_metadata(event.agent_context.messages[-1])
+        assert metadata == [{"timestamp_sec": 0}]
+        assert data(result)["question"] == "刚才是什么颜色？"
+        assert "image_urls" not in data(result)
     finally:
         await plugin.live_sessions.close()
 
@@ -456,6 +501,118 @@ async def test_live_agent_lifecycle_suppresses_background_speech(plugin):
         await plugin.release_agent_context(event, event.agent_context, None)
         assert session.user_busy == 0
         assert session.user_generation > generation
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_live_direct_tool_requires_agent_before_spending_budget(plugin):
+    session = await plugin.live_sessions.create("chat", "alice")
+    plugin.live_sessions.configure(session, {"mode": "demand"})
+    try:
+        result = await plugin.live_observe(Event(agent=False))
+        assert result.isError
+        assert "内置 Agent" in result.content[0].text
+        assert session.analysis_count == 0
+        plugin.context.llm_generate.assert_not_awaited()
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_real_live_tool_loop_uses_main_history_and_temporary_frames(
+    plugin, tmp_path
+):
+    session = await plugin.live_sessions.create("chat", "alice")
+    plugin.live_sessions.configure(session, {"mode": "demand"})
+    picture = tmp_path / "live.jpg"
+    Image.new("RGB", (80, 60), "red").save(picture)
+    await plugin.live_sessions.add_frame(session, picture.read_bytes(), 0)
+    session.transcripts.append(
+        {"start_sec": 0, "end_sec": 1, "text": "红队拿下了这一局"}
+    )
+    event = Event(agent=False)
+    registered = llm_tools.get_func("live_observe")
+    tool = FunctionTool(
+        name="live_observe",
+        description=registered.description,
+        parameters=registered.parameters,
+        handler=plugin.live_observe,
+    )
+    provider = SimpleNamespace(
+        provider_config={"id": "main", "modalities": ["image", "tool_use"]},
+        text_chat=AsyncMock(
+            side_effect=[
+                LLMResponse(
+                    role="assistant",
+                    tools_call_name=["live_observe"],
+                    tools_call_args=[{"question": "谁赢了？"}],
+                    tools_call_ids=["call_live"],
+                ),
+                LLMResponse(role="assistant", completion_text="你支持的红队赢了！"),
+            ]
+        ),
+    )
+    history = [
+        {"role": "user", "content": "我支持红队"},
+        {"role": "assistant", "content": "那我们一起看红队吧"},
+    ]
+    request = ProviderRequest(
+        prompt="刚才谁赢了？",
+        system_prompt="你是一起看比赛的朋友",
+        contexts=history,
+        func_tool=ToolSet([tool]),
+    )
+    context = ContextWrapper(context=SimpleNamespace(event=event))
+    runner = ToolLoopAgentRunner()
+    try:
+        await plugin.prepare_video_resources(event, request)
+        await runner.reset(
+            provider=provider,
+            request=request,
+            run_context=context,
+            tool_executor=FunctionToolExecutor(),
+            agent_hooks=PluginAgentHooks(plugin, event),
+        )
+        async for _ in runner.step_until_done(3):
+            pass
+        assert provider.text_chat.await_count == 2
+        plugin.context.llm_generate.assert_not_awaited()
+        messages = [
+            Message.model_validate(message)
+            for message in provider.text_chat.await_args.kwargs["contexts"]
+        ]
+        serialized = json.dumps(
+            [message.model_dump() for message in messages], ensure_ascii=False
+        )
+        assert "我支持红队" in serialized
+        assert "你是一起看比赛的朋友" in serialized
+        assert "红队拿下了这一局" in serialized
+        image_index = next(
+            index
+            for index, message in enumerate(messages)
+            if isinstance(message.content, list)
+            and any(isinstance(part, ImageURLPart) for part in message.content)
+        )
+        assert messages[image_index - 1].role == "tool"
+        assert messages[image_index - 1].tool_call_id == "call_live"
+        manager = SimpleNamespace(update_conversation=AsyncMock())
+        await InternalAgentSubStage._save_to_history(
+            SimpleNamespace(conv_manager=manager),
+            event,
+            ProviderRequest(
+                conversation=SimpleNamespace(cid="live-conversation"),
+                tool_calls_result=runner.req.tool_calls_result,
+            ),
+            runner.get_final_llm_resp(),
+            context.messages,
+            None,
+        )
+        saved = json.dumps(
+            manager.update_conversation.await_args.kwargs["history"], ensure_ascii=False
+        )
+        assert "image_url" not in saved
+        assert "data:image" not in saved
+        assert "你支持的红队赢了" in saved
+        assert event.get_extra("vision_agent_context") is None
     finally:
         await plugin.live_sessions.close()
 

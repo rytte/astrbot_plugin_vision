@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from dataclasses import replace
 from types import SimpleNamespace
@@ -7,6 +8,10 @@ from unittest.mock import AsyncMock
 import pytest
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import ImageURLPart, Message
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
@@ -128,7 +133,13 @@ async def test_reply_enters_normal_pipeline_with_current_conversation(plugin):
         get_conversation=AsyncMock(return_value=conversation),
     )
     try:
-        await plugin._speak_live(session, "值得吐槽", session.user_generation)
+        await plugin._speak_live(
+            session,
+            "值得吐槽",
+            session.user_generation,
+            image_urls=["data:image/jpeg;base64,AA=="],
+        )
+        payload = session.pending_reply
         event = queue.get_nowait()
         assert isinstance(event, PlatformEvent)
         assert event is not original
@@ -140,6 +151,16 @@ async def test_reply_enters_normal_pipeline_with_current_conversation(plugin):
         results = await collect(plugin.live_reply(event))
         assert results[0].conversation is conversation
         assert "值得吐槽" in results[0].prompt
+        assert [
+            part.image_url.url
+            for part in results[0].extra_user_content_parts
+            if isinstance(part, ImageURLPart)
+        ] == ["data:image/jpeg;base64,AA=="]
+        assert all(
+            part._no_save
+            for part in results[0].extra_user_content_parts
+            if isinstance(part, ImageURLPart)
+        )
         assert session.id not in results[0].prompt
         plugin.context.llm_generate.assert_not_awaited()
         await plugin.bind_agent_context(event, SimpleNamespace(messages=[]))
@@ -148,6 +169,8 @@ async def test_reply_enters_normal_pipeline_with_current_conversation(plugin):
         await plugin.validate_live_reply_response(event, response)
         assert event.is_stopped()
         assert response.completion_text == ""
+        assert session.pending_reply is None
+        assert "image_urls" not in payload
         event = session.reply_route.create(event.get_extra("vision_live_reply"))
         plugin.live_sessions.user_turn(session)
         await plugin.validate_live_reply_request(event, None)
@@ -179,6 +202,100 @@ async def test_reply_freshness_allows_model_latency(
         assert plugin._live_reply_valid(payload) is valid
         session.frames[-1] = replace(session.frames[-1], received=time.monotonic() - 11)
         assert not plugin._live_reply_valid(payload)
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_direct_proactive_queues_once_and_user_turn_cancels(plugin):
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {"mode": "change"})
+    session.frames.append(decode_frame(picture(), 0, 160))
+    session.reply_route = LiveReplyRoute.from_event(original)
+    queue = asyncio.Queue()
+    plugin.context.get_event_queue = lambda: queue
+    try:
+        await plugin.live_sessions.observe(session, automatic=True)
+        assert queue.qsize() == 1
+        payload = session.pending_reply
+        assert payload["image_urls"][0].startswith("data:image/jpeg;base64,")
+        assert session.analysis_count == 1
+        await plugin._speak_live(session, "不应重复入队", session.user_generation)
+        assert queue.qsize() == 1
+        plugin.context.llm_generate.assert_not_awaited()
+        plugin.live_sessions.user_turn(session)
+        assert payload["cancelled"]
+        assert "image_urls" not in payload
+        assert session.pending_reply is None
+        event = queue.get_nowait()
+        await plugin.validate_live_reply_request(event, None)
+        assert event.is_stopped()
+    finally:
+        await plugin.live_sessions.close()
+
+
+async def test_direct_proactive_main_loop_receives_history_and_frames(plugin):
+    from test_plugin import PluginAgentHooks
+
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {"mode": "change"})
+    session.frames.append(decode_frame(picture(), 0, 160))
+    session.reply_route = LiveReplyRoute.from_event(original)
+    queue = asyncio.Queue()
+    plugin.context.get_event_queue = lambda: queue
+    conversation = SimpleNamespace(
+        cid="current",
+        history='[{"role": "user", "content": "我喜欢红色"}]',
+        token_usage=0,
+    )
+    plugin.context.conversation_manager = SimpleNamespace(
+        get_curr_conversation_id=AsyncMock(return_value="current"),
+        get_conversation=AsyncMock(return_value=conversation),
+    )
+    provider = SimpleNamespace(
+        provider_config={"id": "main", "modalities": ["image"]},
+        text_chat=AsyncMock(
+            return_value=LLMResponse(role="assistant", completion_text="[SILENT]")
+        ),
+    )
+    try:
+        await plugin.live_sessions.observe(session, automatic=True)
+        event = queue.get_nowait()
+        request = (await collect(plugin.live_reply(event)))[0]
+        assert request.conversation is conversation
+        # 核心准备请求时从绑定的当前会话加载历史和人设。
+        request.contexts = json.loads(request.conversation.history)
+        request.system_prompt = "你是陪看搭子"
+        context = ContextWrapper(context=SimpleNamespace(event=event))
+        runner = ToolLoopAgentRunner()
+        await runner.reset(
+            provider=provider,
+            request=request,
+            run_context=context,
+            tool_executor=FunctionToolExecutor(),
+            agent_hooks=PluginAgentHooks(plugin, event),
+        )
+        async for _ in runner.step_until_done(1):
+            pass
+        provider.text_chat.assert_awaited_once()
+        plugin.context.llm_generate.assert_not_awaited()
+        messages = [
+            Message.model_validate(item)
+            for item in provider.text_chat.await_args.kwargs["contexts"]
+        ]
+        serialized = json.dumps([m.model_dump() for m in messages], ensure_ascii=False)
+        assert "我喜欢红色" in serialized
+        assert "你是陪看搭子" in serialized
+        assert any(
+            isinstance(part, ImageURLPart)
+            for message in messages
+            if isinstance(message.content, list)
+            for part in message.content
+        )
+        await plugin.validate_live_reply_response(event, runner.get_final_llm_resp())
+        assert event.is_stopped()
+        assert session.pending_reply is None
     finally:
         await plugin.live_sessions.close()
 
