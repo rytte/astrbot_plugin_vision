@@ -254,7 +254,7 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
     )
     video["overview"].update(overview_output_mode="grid", overview_interval=2)
     video["inspect"]["inspect_max_calls"] = 5
-    video["runtime_cache"]["cache_ttl"] = 1800
+    video["runtime_cache"].update(cache_ttl=1800, video_images_in_history=True)
     config["general"].update(tool_timeout=120, max_concurrency=3)
     config.save_config()
     reloaded = AstrBotConfig(config_path, schema=schema)
@@ -277,6 +277,7 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
             tool_timeout=120,
             max_concurrency=3,
             cache_ttl=1800,
+            video_images_in_history=True,
         )
         assert reloaded == config
     finally:
@@ -537,9 +538,11 @@ async def test_live_direct_tool_requires_agent_before_spending_budget(plugin):
         await plugin.live_sessions.close()
 
 
+@pytest.mark.parametrize("keep_images", [False, True])
 async def test_real_live_tool_loop_uses_main_history_and_temporary_frames(
-    plugin, tmp_path
+    plugin, tmp_path, keep_images
 ):
+    plugin.settings = replace(plugin.settings, video_images_in_history=keep_images)
     session = await plugin.live_sessions.create("chat", "alice")
     plugin.live_sessions.configure(session, {"mode": "demand"})
     picture = tmp_path / "live.jpg"
@@ -801,6 +804,7 @@ async def test_missing_agent_context_fails_before_extracting_frames(
     ],
 )
 @pytest.mark.parametrize("asr_enabled", [False, True])
+@pytest.mark.parametrize("keep_images", [False, True])
 async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     plugin,
     sample_video,
@@ -811,7 +815,9 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     invalid_first,
     output_mode,
     asr_enabled,
+    keep_images,
 ):
+    plugin.settings = replace(plugin.settings, video_images_in_history=keep_images)
     if asr_enabled:
         sample_video = audio_video
         plugin.settings = replace(
@@ -976,8 +982,15 @@ async def test_real_agent_loop_receives_images_without_generic_send_prompt(
     ]
     assert history[image_index - 1]["tool_call_id"] == "call_video"
     assert history[0]["content"] == messages[0].model_dump()["content"]
-    assert history[image_index]["content"] == image_message.model_dump()["content"]
+    assert history[image_index]["content"] == [
+        part.model_dump()
+        for part in image_message.content
+        if keep_images or not isinstance(part, ImageURLPart)
+    ]
     saved = json.dumps(history)
+    assert ("data:image/" in saved) is keep_images
+    assert ('"type": "image_url"' in saved) is keep_images
+    assert "已查看视频帧" in json.dumps(history, ensure_ascii=False)
     assert "frame_id" not in saved
     assert not any(frame_id in saved for frame_id in plugin._state(event)["seen"])
     if asr_enabled:
@@ -1429,10 +1442,12 @@ async def test_model_switch_and_selection_control_delegation(
         plugin.context.llm_generate.assert_awaited_once()
 
 
+@pytest.mark.parametrize("keep_images", [False, True])
 async def test_selected_model_receives_frames_and_main_model_only_receives_text(
-    delegated_plugin, sample_video
+    delegated_plugin, sample_video, keep_images
 ):
     plugin = delegated_plugin
+    plugin.settings = replace(plugin.settings, video_images_in_history=keep_images)
     event = Event(messages=[Video(file=str(sample_video))])
     question = "请观察画面颜色的变化"
     await plugin.prepare_video_resources(event, ProviderRequest(prompt=question))

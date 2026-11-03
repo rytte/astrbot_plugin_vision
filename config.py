@@ -213,7 +213,12 @@ VIDEO_CONFIG_GROUPS = {
         "download_allow_fake_ip",
     ),
     "user_quota": ("daily_analysis_limit",),
-    "runtime_cache": ("max_edge_limit", "cache_ttl", "cache_max_mb"),
+    "runtime_cache": (
+        "max_edge_limit",
+        "video_images_in_history",
+        "cache_ttl",
+        "cache_max_mb",
+    ),
 }
 CONFIG_GROUPS = {
     "dependencies": ("ffmpeg_path", "ffprobe_path"),
@@ -324,8 +329,9 @@ class Settings:
     inspect_max_frames: int = 8
     inspect_max_edge: int = 768
     max_edge_limit: int = 1280
+    video_images_in_history: bool = False
     inspect_max_calls: int = 3
-    live_enabled: bool = False
+    live_enabled: bool = True
     live_camera_device: str = ""
     live_audio_device: str = ""
     live_buffer_seconds: float = 60.0

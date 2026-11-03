@@ -512,18 +512,21 @@ class VisionPlugin(Star):
                         if output_mode == "grid"
                         else frames[index].metadata()
                     )
+                    image_part = ImageURLPart(
+                        image_url=ImageURLPart.ImageURL(
+                            url=f"data:{image.mime_type};base64,"
+                            + base64.b64encode(image_bytes).decode("ascii"),
+                            id=str(image.path),
+                        ),
+                    )
+                    if not self.settings.video_images_in_history:
+                        image_part.mark_as_temp()
                     image_parts.extend(
                         [
                             TextPart(
                                 text=json.dumps(metadata, ensure_ascii=False),
                             ),
-                            ImageURLPart(
-                                image_url=ImageURLPart.ImageURL(
-                                    url=f"data:{image.mime_type};base64,"
-                                    + base64.b64encode(image_bytes).decode("ascii"),
-                                    id=str(image.path),
-                                ),
-                            ),
+                            image_part,
                         ]
                     )
                 await self._enhance_asr(event, result, deadline)

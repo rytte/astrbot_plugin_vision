@@ -217,6 +217,12 @@
             "hint": "限制离线视频概览与回看；实时画面使用独立的实时画面长边上限。九宫格保留各帧尺寸，拼接后不再按此值缩放。",
             "default": 1280
           },
+          "video_images_in_history": {
+            "type": "bool",
+            "description": "保留图片到历史",
+            "hint": "仅影响视频概览与详细回看直传主模型的图片。关闭时图片仅当轮有效；开启后随对话历史保留。实时视觉图片始终仅当轮有效。",
+            "default": false
+          },
           "cache_ttl": {
             "type": "float",
             "description": "图片、转写缓存与会话授权有效期（秒）",
@@ -239,7 +245,7 @@
       "live_enabled": {
         "type": "bool",
         "description": "启用实时视觉",
-        "default": false,
+        "default": true,
         "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。。"
       },
       "live_buffer_seconds": {

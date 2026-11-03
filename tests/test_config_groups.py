@@ -65,11 +65,14 @@ def test_old_configuration_keeps_all_values_after_schema_reload(tmp_path, flat):
     assert migrated["dependencies"] == old["dependencies"]
     assert migrated["model_enhancement"] == old["model_enhancement"]
     assert migrated["general"] == {"tool_timeout": 150, "max_concurrency": 3}
-    assert set(migrated["video_analysis"]["runtime_cache"]) == {
+    runtime_fields = {
         "max_edge_limit",
         "cache_ttl",
         "cache_max_mb",
     }
+    if flat:
+        runtime_fields.add("video_images_in_history")
+    assert set(migrated["video_analysis"]["runtime_cache"]) == runtime_fields
     path = tmp_path / "config.json"
     path.write_text(json.dumps(original), encoding="utf-8-sig")
     path.chmod(0o640)
@@ -186,6 +189,9 @@ def test_live_direct_settings_take_precedence_over_removed_subgroup():
         {"video_analysis": {"unknown": {}}},
         {"general": {"tool_timeout": 0}},
         {"runtime_cache": {"max_concurrency": 9}},
+        {"video_analysis": {"runtime_cache": {"video_images_in_history": "false"}}},
+        {"video_analysis": {"runtime_cache": {"video_images_in_history": 1}}},
+        {"video_analysis": {"runtime_cache": {"video_images_in_history": None}}},
     ],
 )
 def test_invalid_configuration_is_rejected_without_changing_file(tmp_path, values):
