@@ -26,6 +26,11 @@ class LiveReplyFilter(filter.CustomFilter):
         return event.get_extra("vision_live_reply") is not None
 
 
+class LiveNoticeFilter(filter.CustomFilter):
+    def filter(self, event, cfg) -> bool:
+        return event.get_extra("vision_live_notice") is not None
+
+
 @dataclass
 class LiveReplyRoute:
     event_type: type
@@ -67,10 +72,16 @@ class LiveReplyRoute:
         )
 
     def create(self, payload: dict) -> AstrMessageEvent:
+        return self._create("[实时陪看观察]", "vision_live_reply", payload)
+
+    def create_notice(self, text: str) -> AstrMessageEvent:
+        return self._create("[实时观察结束]", "vision_live_notice", text)
+
+    def _create(self, label: str, extra: str, payload: dict | str) -> AstrMessageEvent:
         message = copy.copy(self.message)
         message.message_id = "live_" + uuid.uuid4().hex
         message.timestamp = int(time.time())
-        message.message_str = "[实时陪看观察]"
+        message.message_str = label
         message.message = [Plain(text=message.message_str)]
         event = object.__new__(
             LiveWebChatEvent if self.webchat_sender else self.event_type
@@ -85,6 +96,6 @@ class LiveReplyRoute:
         event.role = self.role
         event.is_at_or_wake_command = True
         event.is_wake = True
-        event.set_extra("vision_live_reply", payload)
+        event.set_extra(extra, payload)
         event.set_extra("enable_streaming", False)
         return event

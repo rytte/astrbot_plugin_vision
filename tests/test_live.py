@@ -1,5 +1,6 @@
 import asyncio
 import io
+import logging
 import time
 import wave
 from dataclasses import replace
@@ -437,6 +438,7 @@ async def test_new_frames_do_not_make_old_observation_current(live):
 
 
 async def test_worker_expires_even_while_model_is_blocked(live):
+    live.ended = AsyncMock()
     session = await setup_session(live)
     await push(live, session, 0, "white")
     entered = asyncio.Event()
@@ -452,6 +454,136 @@ async def test_worker_expires_even_while_model_is_blocked(live):
     await asyncio.wait_for(session.task, 2)
     assert session.stopped
     assert session.analysis_task.cancelled()
+    live.ended.assert_awaited_once_with(session, "expired")
+
+
+@pytest.mark.parametrize("mode", ["demand", "interval", "change"])
+async def test_expiry_logs_and_notifies_once_without_fresh_frames(live, caplog, mode):
+    session = await setup_session(live, mode=mode)
+    session.paused = True
+    live.ended = AsyncMock()
+    session.expires = time.monotonic() - 1
+    caplog.set_level(logging.INFO, logger="astrbot")
+    await asyncio.wait_for(session.task, 2)
+    await live.stop(session)
+    await live.close()
+    assert session.stopped
+    assert not live.sessions
+    live.ended.assert_awaited_once_with(session, "expired")
+    assert "reason=expired" in caplog.text
+    assert "count=0/120" in caplog.text
+    assert caplog.text.count("实时观察已结束") == 1
+
+
+@pytest.mark.parametrize("mode", ["demand", "interval", "change"])
+async def test_exhausted_budget_stops_without_retries_in_all_modes(live, caplog, mode):
+    live.settings = replace(live.settings, live_max_analyses=1)
+    live.ended = AsyncMock()
+    session = await setup_session(live, mode=mode)
+    session.analysis_count = 1
+    session.paused = True
+    caplog.set_level(logging.INFO, logger="astrbot")
+    await asyncio.wait_for(session.task, 2)
+    assert session.stopped
+    live.ended.assert_awaited_once_with(session, "analysis_limit")
+    live.analyze.assert_not_awaited()
+    assert "reason=analysis_limit" in caplog.text
+    assert "count=1/1" in caplog.text
+    assert "实时自动观察失败" not in caplog.text
+
+
+async def test_budget_waits_for_final_analysis_and_pending_reply(live):
+    live.settings = replace(live.settings, live_max_analyses=1)
+    live.ended = AsyncMock()
+    session = await setup_session(live)
+    session.last_user = -float("inf")
+    entered, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def blocked(*args):
+        entered.set()
+        await release.wait()
+        return {"summary": "最后一轮", "speak": True, "comment": "最终回应"}
+
+    async def queue_reply(*args):
+        session.pending_reply = {"created_at": time.monotonic()}
+        queued.set()
+
+    live.analyze.side_effect = blocked
+    live.speak.side_effect = queue_reply
+    await push(live, session, 0, "white")
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.sleep(0.3)
+    assert not session.stopped
+    live.ended.assert_not_awaited()
+    release.set()
+    await asyncio.wait_for(queued.wait(), 2)
+    await asyncio.sleep(0.3)
+    assert not session.stopped
+    assert session.pending_reply is not None
+    live.ended.assert_not_awaited()
+    live.cancel_reply(session)
+    await asyncio.wait_for(session.task, 2)
+    live.analyze.assert_awaited_once()
+    live.speak.assert_awaited_once()
+    live.ended.assert_awaited_once_with(session, "analysis_limit")
+
+
+async def test_budget_clears_timed_out_reply_before_ending(live):
+    live.settings = replace(live.settings, live_max_analyses=1)
+    live.ended = AsyncMock()
+    session = await setup_session(live, mode="demand")
+    session.analysis_count = 1
+    payload = {"created_at": time.monotonic() - 46, "image_urls": ["private"]}
+    session.pending_reply = payload
+    await asyncio.wait_for(session.task, 2)
+    assert payload["cancelled"]
+    assert "image_urls" not in payload
+    live.ended.assert_awaited_once_with(session, "analysis_limit")
+
+
+async def test_failed_last_analysis_does_not_retry_exhausted_budget(live):
+    live.settings = replace(live.settings, live_max_analyses=1)
+    live.ended = AsyncMock()
+    live.analyze.side_effect = RuntimeError("provider unavailable")
+    session = await setup_session(live)
+    session.last_user = -float("inf")
+    await push(live, session, 0, "white")
+    await asyncio.wait_for(session.task, 2)
+    live.analyze.assert_awaited_once()
+    live.ended.assert_awaited_once_with(session, "analysis_limit")
+    assert session.stopped
+
+
+async def test_failed_end_notification_does_not_prevent_cleanup(live, caplog):
+    session = await setup_session(live, mode="demand")
+    await push(live, session, 0, "white")
+    session.reply_route = object()
+
+    async def fail_notice(ended_session, reason):
+        assert ended_session.stopped
+        assert not ended_session.frames
+        assert ended_session.reply_route is not None
+        raise RuntimeError("delivery unavailable")
+
+    live.ended = AsyncMock(side_effect=fail_notice)
+    await live.stop(session, reason="expired")
+    await live.stop(session, reason="expired")
+    assert session.stopped
+    assert session.reply_route is None
+    assert not live.sessions
+    assert session.task.done()
+    live.ended.assert_awaited_once_with(session, "expired")
+    assert "实时观察结束通知失败" in caplog.text
+
+
+async def test_manual_replacement_and_unload_do_not_send_extra_notifications(live):
+    live.ended = AsyncMock()
+    await setup_session(live)
+    replacement = await setup_session(live)
+    await live.stop(replacement)
+    await setup_session(live)
+    await live.close()
+    live.ended.assert_not_awaited()
 
 
 @pytest.mark.parametrize("text", ["not json", "[]", "{}", '{"summary":null}'])

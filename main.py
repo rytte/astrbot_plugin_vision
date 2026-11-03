@@ -46,7 +46,7 @@ from .live import (
     transcribe_pcm,
 )
 from .live_capture import read_capture
-from .live_reply import LiveReplyFilter, LiveReplyRoute
+from .live_reply import LiveNoticeFilter, LiveReplyFilter, LiveReplyRoute
 from .media import FFmpegMedia, VideoError
 from .overview_model import invoke_overview_model, prepare_overview_input
 from .presentation import present_frames, presentation_metadata
@@ -131,6 +131,7 @@ class VisionPlugin(Star):
             self._analyze_live,
             self._speak_live,
             self._transcribe_live,
+            ended=self._end_live,
         )
         self.context.add_llm_tools(VideoInspectTool(self))
 
@@ -772,17 +773,17 @@ class VisionPlugin(Star):
             )
         except asyncio.CancelledError:
             if session:
-                await self.live_sessions.stop(session)
+                await self.live_sessions.stop(session, reason="start_cancelled")
             raise
         except (ValueError, VideoError, TimeoutError) as exc:
             if session:
-                await self.live_sessions.stop(session)
+                await self.live_sessions.stop(session, reason="start_failed")
             yield event.plain_result(
                 str(exc) or "采集启动超时，请检查设备权限和媒体地址"
             )
         except Exception:
             if session:
-                await self.live_sessions.stop(session)
+                await self.live_sessions.stop(session, reason="start_failed")
             logger.exception("实时观察启动失败")
             yield event.plain_result("实时观察启动失败，请检查设备和插件日志。")
 
@@ -790,6 +791,25 @@ class VisionPlugin(Star):
         return await transcribe_pcm(
             self.context, self.settings, self.live_sessions.root, pcm
         )
+
+    async def _end_live(self, session, reason: str) -> None:
+        if session.reply_route is None:
+            return
+        if reason == "expired":
+            seconds = max(0, session.expires - session.created)
+            duration = f"{seconds / 60:g} 分钟" if seconds >= 60 else f"{seconds:g} 秒"
+            detail = f"已达到 {duration}会话时限"
+        else:
+            detail = f"已达到 {self.settings.live_max_analyses} 次分析上限"
+        event = session.reply_route.create_notice(
+            f"实时观察已结束：{detail}。如需继续，请重新发送 /live 命令。"
+        )
+        await self.context.get_event_queue().put(event)
+
+    @filter.custom_filter(LiveNoticeFilter)
+    async def live_notice(self, event: AstrMessageEvent):
+        # 固定结束通知沿用原回复流水线，不调用模型或依赖已清理的会话。
+        yield event.plain_result(event.get_extra("vision_live_notice"))
 
     async def _analyze_live(self, session, frames, audio, question, reasons) -> dict:
         async with self.slots:

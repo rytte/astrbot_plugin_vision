@@ -19,7 +19,11 @@ from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.star.filter.command import CommandFilter
 from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.live import decode_frame
-from astrbot_plugin_vision.live_reply import LiveReplyRoute
+from astrbot_plugin_vision.live_reply import (
+    LiveNoticeFilter,
+    LiveReplyFilter,
+    LiveReplyRoute,
+)
 from astrbot_plugin_vision.main import VisionPlugin
 from test_live import picture
 from test_plugin import plugin as plugin  # 复用已有插件夹具。
@@ -427,7 +431,8 @@ async def test_live_reply_uses_core_decorate_and_respond_stages(
         await plugin.live_sessions.close()
 
 
-async def test_webchat_reply_uses_existing_adapter_delivery(monkeypatch):
+@pytest.mark.parametrize("notice", [False, True])
+async def test_webchat_reply_uses_existing_adapter_delivery(monkeypatch, notice):
     from astrbot.core.platform.sources.webchat.webchat_event import WebChatMessageEvent
 
     monkeypatch.setattr(
@@ -449,10 +454,84 @@ async def test_webchat_reply_uses_existing_adapter_delivery(monkeypatch):
         platform_manager=SimpleNamespace(platform_insts=[adapter])
     )
     route = LiveReplyRoute.from_event(event, context)
-    reply = route.create({"session_id": "live"})
+    reply = (
+        route.create_notice("实时观察已结束")
+        if notice
+        else route.create({"session_id": "live"})
+    )
     await reply.send(reply.plain_result("通过平台原有发送方式"))
     sender.assert_awaited_once()
     assert sender.await_args.args[0] == reply.session
     assert sender.await_args.args[1].get_plain_text() == "通过平台原有发送方式"
     await reply.send(None)
     assert sender.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "reason,detail",
+    [("expired", "30 分钟会话时限"), ("analysis_limit", "120 次分析上限")],
+)
+async def test_end_notice_uses_normal_reply_pipeline_without_llm(
+    plugin, monkeypatch, reason, detail
+):
+    import copy
+
+    from astrbot.core.config.default import DEFAULT_CONFIG
+    from astrbot.core.pipeline.respond.stage import RespondStage
+    from astrbot.core.pipeline.result_decorate.stage import ResultDecorateStage
+
+    monkeypatch.setattr(
+        "astrbot.core.platform.astr_message_event.Metric.upload", AsyncMock()
+    )
+    original = PlatformEvent()
+    session = await plugin.live_sessions.create(original.unified_msg_origin, "alice")
+    plugin.live_sessions.configure(session, {})
+    session.reply_route = LiveReplyRoute.from_event(original)
+    queue = asyncio.Queue()
+    plugin.context.get_event_queue = lambda: queue
+    await plugin.live_sessions.stop(session, reason=reason)
+    await plugin.live_sessions.stop(session, reason=reason)
+    assert queue.qsize() == 1
+    event = queue.get_nowait()
+    assert event.unified_msg_origin == original.unified_msg_origin
+    assert event.transport_client is original.transport_client
+    assert LiveNoticeFilter().filter(event, {})
+    assert not LiveReplyFilter().filter(event, {})
+    assert not LiveNoticeFilter().filter(original, {})
+    assert session.reply_route is None
+    assert session.id not in plugin.live_sessions.sessions
+    result = (await collect(plugin.live_notice(event)))[0]
+    assert detail in result.get_plain_text()
+    event.set_result(result)
+    await plugin.validate_live_reply_send(event)
+    assert not event.is_stopped()
+
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    config["platform_settings"]["reply_prefix"] = "陪看："
+    config["platform_settings"]["reply_with_mention"] = False
+    config["platform_settings"]["reply_with_quote"] = False
+    config["platform_settings"]["segmented_reply"]["enable"] = False
+    config["provider_tts_settings"]["enable"] = False
+    config["t2i"] = False
+    plugin.context.get_using_tts_provider_async = AsyncMock(return_value=None)
+    ctx = SimpleNamespace(
+        astrbot_config=config, plugin_manager=SimpleNamespace(context=plugin.context)
+    )
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.result_decorate.stage.star_handlers_registry.get_handlers_by_event_type",
+        lambda *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "astrbot.core.pipeline.respond.stage.call_event_hook",
+        AsyncMock(return_value=False),
+    )
+    decorate, respond = ResultDecorateStage(), RespondStage()
+    await decorate.initialize(ctx)
+    await respond.initialize(ctx)
+    await collect(decorate.process(event))
+    await respond.process(event)
+    assert len(event.sent) == 1
+    assert event.sent[0].get_plain_text().startswith("陪看：实时观察已结束")
+    assert detail in event.sent[0].get_plain_text()
+    assert "/live" in event.sent[0].get_plain_text()
+    plugin.context.llm_generate.assert_not_awaited()

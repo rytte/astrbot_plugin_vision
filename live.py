@@ -325,19 +325,24 @@ class LiveSessions:
         analyze: Callable[..., Awaitable[dict]],
         speak: Callable[..., Awaitable[None]],
         transcribe: Callable[..., Awaitable[str]],
+        *,
+        ended: Callable[[LiveSession, str], Awaitable[None]] | None = None,
     ):
         self.settings = settings
         self.root = root
         self.analyze = analyze
         self.speak = speak
         self.transcribe = transcribe
+        self.ended = ended
         self.sessions: dict[str, LiveSession] = {}
         self.asr_lock = asyncio.Lock()
 
     async def create(self, origin: str, user: str) -> LiveSession:
         for item in list(self.sessions.values()):
             if item.origin == origin or item.expires <= time.monotonic():
-                await self.stop(item)
+                await self.stop(
+                    item, reason="replaced" if item.origin == origin else "expired"
+                )
         if len(self.sessions) >= 4:
             raise ValueError("实时会话已达到 4 个上限")
         now = time.monotonic()
@@ -763,9 +768,32 @@ class LiveSessions:
                 session.busy = False
 
     async def _worker(self, session: LiveSession) -> None:
+        reason = "cancelled"
         try:
-            while not session.stopped and time.monotonic() < session.expires:
+            while not session.stopped:
                 await asyncio.sleep(0.25)
+                now = time.monotonic()
+                if now >= session.expires:
+                    reason = "expired"
+                    break
+                if (
+                    session.pending_reply is not None
+                    and now - session.pending_reply["created_at"]
+                    >= REPLY_TIMEOUT_SECONDS
+                ):
+                    self.cancel_reply(session)
+                # 额度耗尽后等最后一轮分析、工具或排队回复结束，再清理会话。
+                # 此检查也适用于提问模式、暂停或暂时没有新画面的情况。
+                if session.analysis_count >= self.settings.live_max_analyses:
+                    if (
+                        session.operations
+                        or session.busy
+                        or session.pending_reply is not None
+                        or (session.analysis_task and not session.analysis_task.done())
+                    ):
+                        continue
+                    reason = "analysis_limit"
+                    break
                 options = session.options
                 if not options or session.paused:
                     continue
@@ -777,14 +805,8 @@ class LiveSessions:
                     session.audio_task = asyncio.create_task(self.flush_audio(session))
                 if session.stale or options.mode == "demand":
                     continue
-                now = time.monotonic()
                 if session.pending_reply is not None:
-                    if (
-                        now - session.pending_reply["created_at"]
-                        < REPLY_TIMEOUT_SECONDS
-                    ):
-                        continue
-                    self.cancel_reply(session)
+                    continue
                 interval = options.analysis_interval
                 if now - session.last_analysis < interval or (
                     options.mode == "change" and not session.reasons
@@ -800,8 +822,11 @@ class LiveSessions:
                 session.analysis_task = asyncio.create_task(
                     self._automatic_observe(session)
                 )
+        except Exception:
+            reason = "worker_failed"
+            logger.exception("实时观察后台任务失败：session=%s", session.id[:8])
         finally:
-            await self.stop(session)
+            await self.stop(session, reason=reason)
 
     async def _automatic_observe(self, session: LiveSession) -> None:
         try:
@@ -810,14 +835,22 @@ class LiveSessions:
             raise
         except Exception:
             logger.exception("实时自动观察失败：session=%s", session.id[:8])
-            session.error = "实时分析失败、超时或预算已用完；可检查模型与采集状态"
+            session.error = "实时分析失败或超时；可检查模型与采集状态"
             session.last_analysis = time.monotonic()
             session.reasons.add("retry")
 
-    async def stop(self, session: LiveSession) -> None:
+    async def stop(self, session: LiveSession, *, reason: str = "manual") -> None:
         if session.stopped:
             return
         session.stopped = True
+        logger.info(
+            "实时观察已结束：session=%s，reason=%s，elapsed=%.1fs，count=%s/%s",
+            session.id[:8],
+            reason,
+            time.monotonic() - session.created,
+            session.analysis_count,
+            self.settings.live_max_analyses,
+        )
         session.generation += 1
         self.cancel_reply(session)
         self.sessions.pop(session.id, None)
@@ -842,14 +875,21 @@ class LiveSessions:
         session.last_audio_text = ""
         session.reasons.clear()
         session.source_url = ""
-        session.reply_route = None
         session.observation = None
         session.memory = ""
         session.recent_speech.clear()
+        try:
+            if self.ended and reason in {"expired", "analysis_limit"}:
+                async with asyncio.timeout(5):
+                    await self.ended(session, reason)
+        except Exception:
+            logger.exception("实时观察结束通知失败：session=%s", session.id[:8])
+        finally:
+            session.reply_route = None
 
     async def close(self) -> None:
         for session in list(self.sessions.values()):
-            await self.stop(session)
+            await self.stop(session, reason="plugin_unloaded")
         if self.root.exists():
             await asyncio.to_thread(shutil.rmtree, self.root, True)
 
