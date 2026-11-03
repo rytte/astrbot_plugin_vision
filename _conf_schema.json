@@ -220,7 +220,7 @@
           "video_images_in_history": {
             "type": "bool",
             "description": "保留图片到历史",
-            "hint": "仅影响视频概览与详细回看直传主模型的图片。关闭时图片仅当轮有效；开启后随对话历史保留。实时视觉图片始终仅当轮有效。",
+            "hint": "仅影响视频分析直传主模型的图片。关闭时图片仅当轮有效；开启后随对话历史保留，谨慎开启。",
             "default": false
           },
           "cache_ttl": {
@@ -306,7 +306,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1600,
+                "default": 1280,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -335,7 +335,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1600,
+                "default": 1280,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -376,7 +376,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1600,
+                "default": 1280,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -415,14 +415,14 @@
           {
             "__template_key": "demand",
             "sample_interval": 1.0,
-            "max_edge": 1600,
+            "max_edge": 1280,
             "max_frames": 4,
             "lookback_seconds": 0
           },
           {
             "__template_key": "interval",
             "sample_interval": 1.0,
-            "max_edge": 1600,
+            "max_edge": 1280,
             "max_frames": 2,
             "lookback_seconds": 10,
             "observation_interval": 10.0,
@@ -431,7 +431,7 @@
           {
             "__template_key": "change",
             "sample_interval": 0.5,
-            "max_edge": 1600,
+            "max_edge": 1280,
             "max_frames": 3,
             "lookback_seconds": 4,
             "sensitivity": "medium",

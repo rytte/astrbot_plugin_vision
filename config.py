@@ -82,7 +82,7 @@ class LivePreset:
 
 
 def default_live_presets():
-    sizes = {"screen": 1600, "camera": 768, "stream": 640}
+    sizes = {"screen": 1280, "camera": 768, "stream": 640}
     frames = {"screen": (4, 2, 3), "camera": (4, 4, 5), "stream": (4, 4, 6)}
     windows = {"screen": (0, 10, 4), "camera": (2, 10, 4), "stream": (4, 10, 6)}
     return {
