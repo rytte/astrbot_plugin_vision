@@ -23,13 +23,13 @@
       "overview_model_enabled": {
         "type": "bool",
         "description": "启用视频看图模型",
-        "hint": "开启并选择模型后，概览、回看和实时视觉由该模型看图，主模型接收转述文字。关闭或未选择时图片直接进入主对话；实时视觉的定时模式关闭主动发言时，后台仍单独生成静默摘要。",
+        "hint": "开启并选择模型后，概览、回看和实时视觉由该模型看图，主模型接收转述文字。关闭或未选择时直接由主模型看图。",
         "default": false
       },
       "overview_provider_id": {
         "type": "string",
         "description": "视频看图模型",
-        "hint": "选择 AstrBot 已配置且支持图片的模型，用于 video_overview、video_inspect 和实时视觉。调用失败直接报错，不自动改为主模型看图。",
+        "hint": "选择 AstrBot 已配置且支持图片的模型。调用失败直接报错，不自动回退为主模型看图。",
         "default": "",
         "_special": "select_provider",
         "condition": {
@@ -39,13 +39,13 @@
       "asr_enabled": {
         "type": "bool",
         "description": "启用 ASR 语音增强",
-        "hint": "开启后显示 ASR 选择项。仅在已选择的 AstrBot 语音识别提供商可用时转写视频音轨，辅助概览和回看；关闭时不提取音频、不调用 ASR。",
+        "hint": "开启并选择可用模型后，视频分析与实时视觉会转写视频音轨，用于辅助理解；关闭时不提取音频、不调用 ASR。",
         "default": false
       },
       "asr_provider_id": {
         "type": "string",
         "description": "ASR 语音识别提供商",
-        "hint": "选择 AstrBot 已配置的语音识别服务。每段最多 30 秒，时间仅表示片段范围；留空、不可用或转写失败时仍可分析画面。",
+        "hint": "选择 AstrBot 已配置的语音识别服务。每段最多 30 秒，时间仅表示片段范围。",
         "default": "",
         "_special": "select_provider_stt",
         "condition": {
@@ -202,7 +202,7 @@
           "daily_analysis_limit": {
             "type": "int",
             "description": "普通用户每日分析次数上限",
-            "hint": "正整数，默认每天 5 次；按北京时间每天 00:00 重置。同一平台用户跨群聊、私聊共享额度，同一条消息中的概览和回看只计一次。管理员免除此每日限制；重启或重载保留当日用量。",
+            "hint": "正整数，默认每天 5 次；按北京时间每天 00:00 重置。同一平台用户跨群聊、私聊共享额度，同一条消息中的概览和回看只计一次。管理员无限制。",
             "default": 5
           }
         }
@@ -234,42 +234,36 @@
   },
   "live": {
     "type": "object",
-    "description": "实时视觉（开发版）",
+    "description": "实时视觉",
     "items": {
-      "general": {
-        "type": "object",
-        "description": "通用设置",
-        "items": {
-          "live_enabled": {
-            "type": "bool",
-            "description": "启用实时视觉",
-            "default": false,
-            "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。直接采集 AstrBot 宿主设备。"
-          },
-          "live_buffer_seconds": {
-            "type": "float",
-            "description": "实时缓冲秒数",
-            "default": 60,
-            "hint": "最多300秒，同时有帧数和内存上限；不永久保存画面。"
-          },
-          "live_session_seconds": {
-            "type": "float",
-            "description": "单次会话有效期（秒）",
-            "default": 1800,
-            "hint": "到期自动停止，最多4小时；同时最多4个会话。"
-          },
-          "live_max_analyses": {
-            "type": "int",
-            "description": "单会话模型分析次数上限",
-            "default": 120,
-            "hint": "独立于离线视频每日额度；包含后台观察和 live_observe。直传时主模型看图并决定回复或沉默；启用独立看图模型时，主动发言还需一次主模型调用。"
-          },
-          "live_speech_cooldown": {
-            "type": "float",
-            "description": "主动发言冷却时间（秒）",
-            "default": 15
-          }
-        }
+      "live_enabled": {
+        "type": "bool",
+        "description": "启用实时视觉",
+        "default": false,
+        "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。。"
+      },
+      "live_buffer_seconds": {
+        "type": "float",
+        "description": "实时缓冲秒数",
+        "default": 60,
+        "hint": "最多300秒，同时有帧数和内存上限；不永久保存画面。"
+      },
+      "live_session_seconds": {
+        "type": "float",
+        "description": "单次会话有效期（秒）",
+        "default": 1800,
+        "hint": "到期自动停止，最多4小时；同时最多4个会话。"
+      },
+      "live_max_analyses": {
+        "type": "int",
+        "description": "单会话模型分析次数上限",
+        "default": 120,
+        "hint": "包含后台观察和 live_observe。直传时主模型看图并决定回复或沉默；启用独立看图模型时，主动发言还需一次主模型调用。"
+      },
+      "live_speech_cooldown": {
+        "type": "float",
+        "description": "主动发言冷却时间（秒）",
+        "default": 15
       },
       "devices": {
         "type": "object",
@@ -285,7 +279,7 @@
             "type": "string",
             "description": "本机音频设备",
             "default": "",
-            "hint": "Linux留空：屏幕取默认播放回环、摄像头取默认麦克风（需要parec）；Windows填写DirectShow音频设备名称；macOS摄像头默认麦克风0，屏幕需配置回环设备索引。ASR复用现有配置。"
+            "hint": "Linux留空：屏幕来源取默认播放回环、摄像头来源取默认麦克风（需要parec）；Windows填写DirectShow音频设备名称；macOS摄像头来源默认麦克风0，屏幕来源需配置回环设备索引。ASR复用现有配置。"
           }
         }
       },

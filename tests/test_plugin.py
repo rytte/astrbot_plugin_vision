@@ -37,7 +37,12 @@ from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.star_manager import PluginManager
 from astrbot.dashboard.services.plugin_service import PluginService
 from astrbot_plugin_vision.agent_images import ToolImageBuffer
-from astrbot_plugin_vision.config import CONFIG_GROUPS, VIDEO_CONFIG_GROUPS, Settings
+from astrbot_plugin_vision.config import (
+    CONFIG_GROUPS,
+    LIVE_GENERAL_FIELDS,
+    VIDEO_CONFIG_GROUPS,
+    Settings,
+)
 from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
 from astrbot_plugin_vision.quota import BEIJING_TZ, DailyQuota
@@ -205,8 +210,8 @@ def test_configuration_schema_matches_defaults(tmp_path):
     schema = {
         key: item for group in schema.values() for key, item in group["items"].items()
     }
-    for group in ("general", "devices"):
-        schema.update(live_schema[group]["items"])
+    schema.update({key: live_schema[key] for key in LIVE_GENERAL_FIELDS})
+    schema.update(live_schema["devices"]["items"])
     assert set(schema) == {field.name for field in fields(Settings)} - {"live_presets"}
     assert "allowed_video_roots" not in schema
     assert schema["overview_provider_id"]["_special"] == "select_provider"

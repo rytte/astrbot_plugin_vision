@@ -148,6 +148,8 @@ def test_invalid_preset_is_rejected(key, value):
         {"screen": [{"__template_key": "demand"}, {"__template_key": "demand"}]},
         {"screen": {"demand": []}},
         {"devices": []},
+        {"general": []},
+        {"general": {"unknown": True}},
         {"screen": {"unknown": {}}},
         {"camera": {"demand": {"proactive": True}}},
         {"stream": {"interval": {"sensitivity": "high"}}},

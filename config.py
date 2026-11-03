@@ -106,7 +106,11 @@ def migrate_live_config(values: Mapping) -> dict:
     if not isinstance(live, Mapping):
         raise ValueError("live 必须是配置对象")
     live = dict(live)
-    general, devices = {}, {}
+    general = live.pop("general", {})
+    if not isinstance(general, Mapping):
+        raise ValueError("live.general 必须是配置对象")
+    if set(general) - set(LIVE_GENERAL_FIELDS):
+        raise ValueError("未知实时配置 live.general")
     removed = ("live_host", "live_port", "live_public_url", "live_stream_url")
     legacy_presets = {
         "live_max_edge": "max_edge",
@@ -121,19 +125,20 @@ def migrate_live_config(values: Mapping) -> dict:
             old[key] = values.pop(key)
         if key in live:
             old[key] = live.pop(key)
-    for group, names, result in (
-        ("general", LIVE_GENERAL_FIELDS, general),
-        ("devices", LIVE_DEVICE_FIELDS, devices),
-    ):
-        current = live.get(group, {})
-        if not isinstance(current, Mapping):
-            raise ValueError(f"live.{group} 必须是配置对象")
-        result.update(current)
-        for key in names:
-            if key in old:
-                result[key] = old[key]
-        if result or group in live:
-            live[group] = result
+    for key in LIVE_GENERAL_FIELDS:
+        if key in old:
+            live[key] = old[key]
+        elif key in general:
+            live[key] = general[key]
+    devices = live.get("devices", {})
+    if not isinstance(devices, Mapping):
+        raise ValueError("live.devices 必须是配置对象")
+    devices = dict(devices)
+    for key in LIVE_DEVICE_FIELDS:
+        if key in old:
+            devices[key] = old[key]
+    if devices or "devices" in live:
+        live["devices"] = devices
     for source in LIVE_SOURCES:
         if source not in live and not set(old).intersection(legacy_presets):
             continue
@@ -220,7 +225,7 @@ CONFIG_GROUPS = {
     ),
     "general": ("tool_timeout", "max_concurrency"),
     "video_analysis": tuple(VIDEO_CONFIG_GROUPS),
-    "live": ("general", "devices", *LIVE_SOURCES),
+    "live": (*LIVE_GENERAL_FIELDS, "devices", *LIVE_SOURCES),
 }
 
 
@@ -346,14 +351,11 @@ class Settings:
         unknown = set(live) - set(CONFIG_GROUPS["live"])
         if unknown:
             raise ValueError("未知实时配置：" + ", ".join(sorted(unknown)))
-        for group, names in (
-            ("general", LIVE_GENERAL_FIELDS),
-            ("devices", LIVE_DEVICE_FIELDS),
-        ):
-            section = live.get(group, {})
-            if set(section) - set(names):
-                raise ValueError(f"未知实时配置 live.{group}")
-            values.update(section)
+        values.update({key: live[key] for key in LIVE_GENERAL_FIELDS if key in live})
+        devices = live.get("devices", {})
+        if set(devices) - set(LIVE_DEVICE_FIELDS):
+            raise ValueError("未知实时配置 live.devices")
+        values.update(devices)
         presets = default_live_presets()
         for source in LIVE_SOURCES:
             for entry in live.get(source, []):

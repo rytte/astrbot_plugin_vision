@@ -1,7 +1,7 @@
 import copy
 import json
 import stat
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -116,6 +116,63 @@ def test_current_groups_take_precedence_when_combined_with_legacy_values():
     assert settings.cache_max_mb == 400
     assert settings.overview_interval == 7
     assert settings.overview_max_frames == 60
+    assert original == snapshot
+
+
+def test_live_general_settings_survive_removing_subgroup_and_astrbot_reload(tmp_path):
+    live_fields = {
+        "live_enabled": True,
+        "live_buffer_seconds": 90,
+        "live_session_seconds": 2400,
+        "live_max_analyses": 80,
+        "live_speech_cooldown": 25,
+    }
+    original = {
+        "general": {"tool_timeout": 90},
+        "live": {
+            "general": live_fields,
+            "devices": {"live_audio_device": "selected-audio"},
+            "screen": [{"__template_key": "demand", "max_frames": 6}],
+        },
+    }
+    expected = replace(
+        Settings(), **live_fields, live_audio_device="selected-audio", tool_timeout=90
+    )
+    expected.live_presets["screen"]["demand"] = replace(
+        expected.live_preset("screen", "demand"), max_frames=6
+    )
+    snapshot = copy.deepcopy(original)
+    migrated = migrate_config(original)
+    assert original == snapshot
+    assert "general" not in migrated["live"]
+    assert all(migrated["live"][key] == value for key, value in live_fields.items())
+    assert migrated["general"] == original["general"]
+    assert migrate_config(migrated) == migrated
+    path = tmp_path / "live-config.json"
+    path.write_text(json.dumps(original))
+    assert migrate_config_file(path)
+    schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
+    config = AstrBotConfig(str(path), schema=schema)
+    assert "general" not in config["live"]
+    assert Settings.from_mapping(config) == expected
+    config.save_config()
+    assert Settings.from_mapping(AstrBotConfig(str(path), schema=schema)) == expected
+    assert not migrate_config_file(path)
+
+
+def test_live_direct_settings_take_precedence_over_removed_subgroup():
+    original = {
+        "live_enabled": True,
+        "live": {
+            "live_enabled": False,
+            "live_buffer_seconds": 120,
+            "general": {"live_enabled": True, "live_buffer_seconds": 90},
+        },
+    }
+    snapshot = copy.deepcopy(original)
+    assert Settings.from_mapping(original) == replace(
+        Settings(), live_enabled=False, live_buffer_seconds=120
+    )
     assert original == snapshot
 
 
