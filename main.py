@@ -20,12 +20,16 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.star.register.star_handler import get_handler_or_create
 from astrbot.core.star.star_handler import EventType
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path, get_astrbot_temp_path
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_config_path,
+    get_astrbot_data_path,
+    get_astrbot_temp_path,
+)
 from mcp.types import CallToolResult, TextContent
 
 from .agent_images import ToolImageBuffer, defer_tool_images
 from .asr import VideoASR
-from .config import Settings
+from .config import Settings, migrate_live_config, migrate_live_config_file
 from .debug import DebugSessions
 from .debug_web import DebugWeb
 from .downloads import VideoDownloads
@@ -69,12 +73,29 @@ VIDEO_SUFFIXES = {
 }
 
 
+# AstrBot 先导入插件，再加载 schema；构造函数才迁移会丢失已被删除的旧字段。
+if __name__.startswith("data.plugins."):
+    if migrate_live_config_file(
+        Path(get_astrbot_config_path()) / f"{Path(__file__).parent.name}_config.json"
+    ):
+        logger.info("实时视觉配置已迁移为来源与响应模式预设，原配置已备份")
+
+
 class VisionPlugin(Star):
     """为主对话模型提供受限的视频概览和按需回看。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         super().__init__(context)
-        self.settings = Settings.from_mapping(config or {})
+        normalized = migrate_live_config(config or {})
+        self.settings = Settings.from_mapping(normalized)
+        if (
+            config is not None
+            and normalized != config
+            and hasattr(config, "save_config")
+        ):
+            config.clear()
+            config.update(normalized)
+            config.save_config()
         roots = [Path(get_astrbot_data_path()), Path(get_astrbot_temp_path())]
         for root in roots:
             root.mkdir(parents=True, exist_ok=True)
@@ -974,13 +995,16 @@ class VisionPlugin(Star):
 
     @llm_tool(name="live_observe")
     async def live_observe(
-        self, event: AstrMessageEvent, question: str = "", lookback_sec: float = 12
+        self,
+        event: AstrMessageEvent,
+        question: str = "",
+        lookback_sec: float | None = None,
     ) -> CallToolResult:
         """查看当前发送者在当前聊天共享的最新画面，结合最近画面与ASR核验问题；不能读取其他聊天或用户的共享。
 
         Args:
             question(string): 本次希望核验的问题。
-            lookback_sec(number): 回看最近多少秒，1～60秒，受实际缓冲限制，默认12秒。
+            lookback_sec(number): 本次取帧时间范围，0只看最新画面，最多300秒且不超过缓冲；省略使用当前来源与响应模式预设。
         """
         operation = asyncio.current_task()
         session = None
@@ -990,8 +1014,12 @@ class VisionPlugin(Star):
                 raise VideoError(
                     "请先在当前聊天使用 /live <屏幕|摄像头|URL> <响应模式：提问|定时|变化> <观察指令>"
                 )
-            lookback = number(
-                lookback_sec, "回看秒数", 1, min(60, self.settings.live_buffer_seconds)
+            lookback = (
+                min(session.options.lookback_seconds, self.settings.live_buffer_seconds)
+                if lookback_sec is None
+                else number(
+                    lookback_sec, "取帧时间范围", 0, self.settings.live_buffer_seconds
+                )
             )
             if not isinstance(question, str) or len(question) > 4000:
                 raise ValueError("问题最多4000字")

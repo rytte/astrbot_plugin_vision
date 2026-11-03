@@ -2,6 +2,7 @@ import asyncio
 import io
 import os
 import sys
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -67,10 +68,8 @@ async def test_actual_capture_respects_live_resolution(
     capture, ffmpeg, monkeypatch, source_size, max_edge, expected
 ):
     sessions, session = capture
-    sessions.settings = replace(
-        sessions.settings, live_max_edge=max_edge, max_edge_limit=1024
-    )
-    session.options = replace(session.options, audio=False)
+    sessions.settings = replace(sessions.settings, max_edge_limit=1024)
+    session.options = replace(session.options, audio=False, max_edge=max_edge)
     width, height = source_size
     monkeypatch.setattr(
         "astrbot_plugin_vision.live_capture.capture_input",
@@ -86,6 +85,45 @@ async def test_actual_capture_respects_live_resolution(
     assert session.frames, session.error
     with Image.open(io.BytesIO(session.frames[-1].jpeg)) as image:
         assert image.size == expected
+    await sessions.stop(session)
+    assert session.stream_task.done()
+
+
+@pytest.mark.parametrize("sample_interval", [0.5, 2, 30])
+async def test_capture_outputs_first_frame_promptly_and_uses_preset_cadence(
+    capture, ffmpeg, monkeypatch, sample_interval
+):
+    sessions, session = capture
+    session.options = replace(
+        session.options, audio=False, sample_interval=sample_interval
+    )
+    second_frame = asyncio.Event()
+    add_frame = sessions.add_frame
+
+    async def receive(*args):
+        await add_frame(*args)
+        if len(session.frames) >= 2:
+            second_frame.set()
+
+    monkeypatch.setattr(sessions, "add_frame", receive)
+    monkeypatch.setattr(
+        "astrbot_plugin_vision.live_capture.capture_input",
+        AsyncMock(
+            return_value=CaptureInput(
+                ("-re", "-f", "lavfi", "-i", "color=c=red:s=160x90:r=8"),
+                None,
+            )
+        ),
+    )
+    started = time.monotonic()
+    session.stream_task = asyncio.create_task(read_capture(sessions, session, ffmpeg))
+    await asyncio.wait_for(session.ready.wait(), 5)
+    assert session.frames, session.error
+    assert session.frames[0].received - started < 5
+    if sample_interval < 30:
+        await asyncio.wait_for(second_frame.wait(), 6)
+        gap = session.frames[1].received - session.frames[0].received
+        assert gap == pytest.approx(sample_interval, abs=0.3)
     await sessions.stop(session)
     assert session.stream_task.done()
 

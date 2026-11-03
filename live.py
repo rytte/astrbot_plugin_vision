@@ -21,13 +21,13 @@ from urllib.parse import urlsplit
 
 from PIL import Image, UnidentifiedImageError
 
-from .config import Settings
+from .config import LIVE_MODE_FIELDS, LIVE_PRESET_FIELDS, LivePreset, Settings
 from .media import VideoError
 
 MAX_FRAME_BYTES = 1024 * 1024
 MAX_BUFFER_BYTES = 24 * 1024 * 1024
 MAX_AUDIO_BYTES = 32000 * 10
-MAX_FRAMES = 300
+MAX_FRAMES = 1500
 FRESH_SECONDS = 10
 MODEL_TIMEOUT_SECONDS = 45
 REPLY_TIMEOUT_SECONDS = 45
@@ -80,13 +80,14 @@ def parse_live_command(arguments: str, settings: Settings) -> tuple[dict, str]:
         if not valid or any(ord(char) < 32 for char in source):
             raise ValueError("来源须为屏幕、摄像头或 HTTP(S)/RTSP/RTMP 媒体直链")
         url, source = source, "stream"
+    preset = settings.live_preset(source, mode)
     return {
         "source": source,
         "mode": mode,
         "focus": focus.strip(),
-        "interval": settings.live_observation_interval,
-        "sensitivity": settings.live_sensitivity,
-        "proactive": settings.live_interval_proactive,
+        "interval": preset.observation_interval,
+        "sensitivity": preset.sensitivity,
+        "proactive": preset.proactive,
         "audio": settings.asr_enabled and bool(settings.asr_provider_id),
     }, url
 
@@ -110,6 +111,11 @@ class LiveOptions:
     audio: bool = False
     interval: float = 10.0
     sensitivity: str = "medium"
+    sample_interval: float = 1.0
+    max_edge: int = 1280
+    max_frames: int = 4
+    lookback_seconds: float = 12.0
+    min_analysis_interval: float = 5.0
     focus: str = "一起观看，遇到有意思的内容简短吐槽；不必每次都发言。"
 
     @classmethod
@@ -128,17 +134,29 @@ class LiveOptions:
             "change",
         ):
             raise ValueError("来源或响应模式无效")
+        preset = settings.live_preset(data["source"], data["mode"])
+        preset_values = {
+            name: values.get(name, getattr(preset, name))
+            for name in LIVE_PRESET_FIELDS + LIVE_MODE_FIELDS[data["mode"]]
+        }
+        # interval 是会话内部字段名，配置界面使用 observation_interval。
+        preset_values.pop("observation_interval", None)
+        validated = LivePreset.parse(preset_values, preset, data["mode"], "实时预设")
+        for name in LIVE_PRESET_FIELDS + ("min_analysis_interval",):
+            data[name] = getattr(validated, name)
+        for name, preset_name in (
+            ("interval", "observation_interval"),
+            ("proactive", "proactive"),
+            ("sensitivity", "sensitivity"),
+        ):
+            if name not in values:
+                data[name] = getattr(preset, preset_name)
         if type(data["audio"]) is not bool or type(data["proactive"]) is not bool:
             raise ValueError("音频和主动发言开关必须是布尔值")
         data["proactive"] = data["mode"] == "change" or (
             data["mode"] == "interval" and data["proactive"]
         )
         data["interval"] = number(data["interval"], "观察间隔", 0.1, 300)
-        if (
-            data["mode"] == "interval"
-            and data["interval"] < settings.live_min_analysis_interval
-        ):
-            raise ValueError("观察间隔不能小于后台分析最短间隔")
         if data["sensitivity"] not in ("low", "medium", "high"):
             raise ValueError("变化灵敏度无效")
         if not isinstance(data["focus"], str) or len(data["focus"]) > 1000:
@@ -148,6 +166,14 @@ class LiveOptions:
     @property
     def threshold(self) -> float:
         return {"low": 0.22, "medium": 0.12, "high": 0.05}[self.sensitivity]
+
+    @property
+    def fresh_seconds(self) -> float:
+        return max(FRESH_SECONDS, self.sample_interval * 3)
+
+    @property
+    def analysis_interval(self) -> float:
+        return self.interval if self.mode == "interval" else self.min_analysis_interval
 
 
 @dataclass(frozen=True)
@@ -182,6 +208,59 @@ def frame_distance(left: LiveFrame, right: LiveFrame) -> float:
     return sum(abs(a - b) for a, b in zip(left.fingerprint, right.fingerprint)) / (
         255 * len(left.fingerprint)
     )
+
+
+def select_frames(
+    frames: list[LiveFrame],
+    *,
+    source: str,
+    mode: str,
+    max_frames: int,
+    lookback: float,
+    reference: LiveFrame | None = None,
+) -> list[LiveFrame]:
+    """最新画面必选；定时覆盖本轮，变化保留显著变化前后的证据。"""
+    latest = frames[-1]
+    if lookback == 0 or max_frames == 1:
+        return [latest]
+    cutoff = latest.timestamp - lookback
+    if mode == "interval" and reference is not None:
+        cutoff = max(cutoff, reference.timestamp)
+    candidates = [frame for frame in frames if frame.timestamp >= cutoff]
+    # 合并相邻近重复画面，保留该段最后一张；不删除动作前后重现的同一状态。
+    tolerance = {"screen": 0.002, "camera": 0.01, "stream": 0.015}[source]
+    distinct = []
+    for frame in candidates:
+        if distinct and frame_distance(distinct[-1], frame) <= tolerance:
+            distinct[-1] = frame
+        else:
+            distinct.append(frame)
+    if len(distinct) <= max_frames:
+        return distinct
+    selected = {len(distinct) - 1}
+    if mode == "change":
+        changes = sorted(
+            range(1, len(distinct)),
+            key=lambda i: (frame_distance(distinct[i - 1], distinct[i]), i),
+            reverse=True,
+        )
+        for index in changes:
+            # 两帧上限时优先保留变化前状态，与最新状态对比。
+            for candidate in (index - 1, index):
+                if len(selected) < max_frames:
+                    selected.add(candidate)
+            if len(selected) == max_frames:
+                break
+    else:
+        span = distinct[-1].timestamp - distinct[0].timestamp
+        for index in range(max_frames - 1):
+            target = distinct[0].timestamp + span * index / (max_frames - 1)
+            nearest = min(
+                (i for i in range(len(distinct)) if i not in selected),
+                key=lambda i: abs(distinct[i].timestamp - target),
+            )
+            selected.add(nearest)
+    return [distinct[index] for index in sorted(selected)]
 
 
 @dataclass
@@ -233,9 +312,8 @@ class LiveSession:
 
     @property
     def stale(self) -> bool:
-        return (
-            not self.frames
-            or time.monotonic() - self.frames[-1].received > FRESH_SECONDS
+        return not self.frames or time.monotonic() - self.frames[-1].received > (
+            self.options.fresh_seconds if self.options else FRESH_SECONDS
         )
 
 
@@ -313,10 +391,14 @@ class LiveSessions:
             )
             if session.frames and timestamp <= session.frames[-1].timestamp:
                 raise ValueError("画面时间必须递增")
-            if session.frames and time.monotonic() - session.frames[-1].received < 0.2:
+            if (
+                session.frames
+                and timestamp - session.frames[-1].timestamp
+                < session.options.sample_interval * 0.5
+            ):
                 return
             frame = await asyncio.to_thread(
-                decode_frame, data, timestamp, self.settings.live_max_edge
+                decode_frame, data, timestamp, session.options.max_edge
             )
             if session.stopped or session.paused:
                 return
@@ -465,7 +547,8 @@ class LiveSessions:
             if session.observation
             else None,
             "observation_stale": not session.observation
-            or time.monotonic() - session.observed_received > FRESH_SECONDS,
+            or time.monotonic() - session.observed_received
+            > (session.options.fresh_seconds if session.options else FRESH_SECONDS),
             "recent_speech": list(session.recent_speech),
             "audio_status": session.audio_status,
             "audio_completed_sec": session.asr_completed_end,
@@ -478,7 +561,7 @@ class LiveSessions:
         self,
         session: LiveSession,
         question: str = "",
-        lookback: float = 12,
+        lookback: float | None = None,
         *,
         automatic: bool = False,
         direct: bool | None = None,
@@ -496,7 +579,7 @@ class LiveSessions:
         self,
         session: LiveSession,
         question: str = "",
-        lookback: float = 12,
+        lookback: float | None = None,
         *,
         automatic: bool = False,
         direct: bool | None = None,
@@ -509,7 +592,7 @@ class LiveSessions:
                 or time.monotonic() >= session.expires
             ):
                 raise VideoError(
-                    "实时画面已暂停、断开或超过 10 秒未更新，不能作为当前画面"
+                    "实时画面已暂停、断开或超过采样有效期未更新，不能作为当前画面"
                 )
             options = session.options
             if options is None:
@@ -535,25 +618,30 @@ class LiveSessions:
                 raise VideoError("本次实时会话的分析预算已用完，请重新开启会话")
             if (
                 automatic
-                and time.monotonic() - session.last_analysis
-                < self.settings.live_min_analysis_interval
+                and time.monotonic() - session.last_analysis < options.analysis_interval
             ):
                 return {}
             generation, user_generation = session.generation, session.user_generation
             latest = session.frames[-1]
-            candidates = [
-                f for f in session.frames if latest.timestamp - f.timestamp <= lookback
-            ]
-            frames = [
-                candidates[i]
-                for i in sorted(
-                    {round((len(candidates) - 1) * i / 3) for i in range(4)}
-                )
-            ]
+            lookback = min(
+                options.lookback_seconds
+                if lookback is None
+                else number(lookback, "取帧时间范围", 0, 300),
+                self.settings.live_buffer_seconds,
+            )
+            frames = select_frames(
+                list(session.frames),
+                source=options.source,
+                mode=options.mode,
+                max_frames=options.max_frames,
+                lookback=lookback,
+                reference=session.reference if automatic else None,
+            )
+            audio_start = latest.timestamp - max(lookback, 5 if options.audio else 0)
             audio = [
                 item
                 for item in session.transcripts
-                if item["end_sec"] >= frames[0].timestamp
+                if item["end_sec"] >= audio_start
                 and item["start_sec"] <= latest.timestamp
             ]
             reasons = sorted(session.reasons)
@@ -601,6 +689,7 @@ class LiveSessions:
                     "end_sec": latest.timestamp,
                     "summary": result["summary"][:4000],
                     "evidence_times": [f.timestamp for f in frames],
+                    "sampling_window_sec": lookback,
                     "audio": audio,
                     "audio_status": session.audio_status,
                     "audio_completed_sec": session.asr_completed_end,
@@ -612,7 +701,7 @@ class LiveSessions:
                 now = time.monotonic()
                 # 采集是否断流与模型处理耗时分开判断；正常推理超过 10 秒
                 # 不应被当作断流。原始证据时间仍保留，不伪装成最新画面。
-                timely = now - latest.received <= FRESH_SECONDS + min(
+                timely = now - latest.received <= options.fresh_seconds + min(
                     self.settings.tool_timeout, MODEL_TIMEOUT_SECONDS
                 )
                 if automatic:
@@ -659,7 +748,7 @@ class LiveSessions:
                         )
                 observation = {
                     **session.observation,
-                    "stale": time.monotonic() - latest.received > FRESH_SECONDS,
+                    "stale": time.monotonic() - latest.received > options.fresh_seconds,
                     "memory": session.memory,
                 }
                 if direct:
@@ -696,11 +785,7 @@ class LiveSessions:
                     ):
                         continue
                     self.cancel_reply(session)
-                interval = (
-                    options.interval
-                    if options.mode == "interval"
-                    else self.settings.live_min_analysis_interval
-                )
+                interval = options.analysis_interval
                 if now - session.last_analysis < interval or (
                     options.mode == "change" and not session.reasons
                 ):

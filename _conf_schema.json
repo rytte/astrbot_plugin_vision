@@ -191,114 +191,508 @@
     "type": "object",
     "description": "实时视觉（开发版）",
     "items": {
-      "live_enabled": {
-        "type": "bool",
-        "description": "启用实时视觉",
-        "default": false,
-        "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。直接采集 AstrBot 宿主设备。"
-      },
-      "live_max_edge": {
-        "type": "int",
-        "description": "实时画面长边上限（像素）",
-        "default": 1280,
-        "hint": "64～4096，等比例缩小且不放大原图。独立控制实时采集和模型输入图片，不受概览尺寸或离线视频单帧硬上限限制。",
-        "condition": {
-          "live_enabled": true
+      "general": {
+        "type": "object",
+        "description": "通用设置",
+        "items": {
+          "live_enabled": {
+            "type": "bool",
+            "description": "启用实时视觉",
+            "default": false,
+            "hint": "管理员使用 /live <来源> <响应模式> <观察指令> 启动，来源为屏幕、摄像头或媒体URL，响应模式为提问、定时或变化；/live end 结束。直接采集 AstrBot 宿主设备。"
+          },
+          "live_buffer_seconds": {
+            "type": "float",
+            "description": "实时缓冲秒数",
+            "default": 60,
+            "hint": "最多300秒，同时有帧数和内存上限；不永久保存画面。"
+          },
+          "live_session_seconds": {
+            "type": "float",
+            "description": "单次会话有效期（秒）",
+            "default": 1800,
+            "hint": "到期自动停止，最多4小时；同时最多4个会话。"
+          },
+          "live_max_analyses": {
+            "type": "int",
+            "description": "单会话模型分析次数上限",
+            "default": 120,
+            "hint": "独立于离线视频每日额度；包含后台观察和 live_observe。直传时主模型看图并决定回复或沉默；启用独立看图模型时，主动发言还需一次主模型调用。"
+          },
+          "live_speech_cooldown": {
+            "type": "float",
+            "description": "主动发言冷却时间（秒）",
+            "default": 15
+          }
         }
       },
-      "live_sensitivity": {
-        "type": "string",
-        "description": "变化灵敏度",
-        "default": "medium",
-        "options": [
-          "low",
-          "medium",
-          "high"
-        ],
-        "hint": "low低、medium中、high高；本地RGB差异决定是否观察，再由模型判断是否评论。",
-        "condition": {
-          "live_enabled": true
+      "devices": {
+        "type": "object",
+        "description": "设备设置",
+        "items": {
+          "live_camera_device": {
+            "type": "string",
+            "description": "摄像头设备",
+            "default": "",
+            "hint": "留空自动使用默认设备。Linux如 /dev/video0；Windows为DirectShow名称；macOS为AVFoundation设备索引或名称。"
+          },
+          "live_audio_device": {
+            "type": "string",
+            "description": "本机音频设备",
+            "default": "",
+            "hint": "Linux留空：屏幕取默认播放回环、摄像头取默认麦克风（需要parec）；Windows填写DirectShow音频设备名称；macOS摄像头默认麦克风0，屏幕需配置回环设备索引。ASR复用现有配置。"
+          }
         }
       },
-      "live_observation_interval": {
-        "type": "float",
-        "description": "定时模式观察间隔（秒）",
-        "default": 10,
-        "hint": "不小于后台分析最短间隔，最多300秒。",
-        "condition": {
-          "live_enabled": true
-        }
+      "screen": {
+        "type": "template_list",
+        "description": "屏幕预设",
+        "hint": "用于 /live 屏幕。优先清晰截图和变化前后对比，减少重复画面。 每种模式只保留一项，删除后使用该模式的默认预设，可从添加条目恢复。",
+        "templates": {
+          "demand": {
+            "name": "提问",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1600,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 4,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 0,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              }
+            }
+          },
+          "interval": {
+            "name": "定时",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1600,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 2,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 10,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "observation_interval": {
+                "type": "float",
+                "description": "观察间隔（秒）",
+                "default": 10.0,
+                "hint": "0.2～300秒。定时调用模型观察的间隔，是否发言由模型和主动发言设置决定。"
+              },
+              "proactive": {
+                "type": "bool",
+                "description": "允许主动发言",
+                "default": true,
+                "hint": "关闭后仍在后台观察；用户提问时才回答。"
+              }
+            }
+          },
+          "change": {
+            "name": "变化",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 0.5,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1600,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 3,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 4,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "sensitivity": {
+                "type": "string",
+                "description": "变化灵敏度",
+                "default": "medium",
+                "hint": "low低、medium中、high高；只决定是否需要观察，是否回应由模型判断。",
+                "options": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "min_analysis_interval": {
+                "type": "float",
+                "description": "最短观察间隔（秒）",
+                "default": 5.0,
+                "hint": "0.2～300秒。合并连续变化，限制模型调用频率。"
+              }
+            }
+          }
+        },
+        "default": [
+          {
+            "__template_key": "demand",
+            "sample_interval": 1.0,
+            "max_edge": 1600,
+            "max_frames": 4,
+            "lookback_seconds": 0
+          },
+          {
+            "__template_key": "interval",
+            "sample_interval": 1.0,
+            "max_edge": 1600,
+            "max_frames": 2,
+            "lookback_seconds": 10,
+            "observation_interval": 10.0,
+            "proactive": true
+          },
+          {
+            "__template_key": "change",
+            "sample_interval": 0.5,
+            "max_edge": 1600,
+            "max_frames": 3,
+            "lookback_seconds": 4,
+            "sensitivity": "medium",
+            "min_analysis_interval": 5.0
+          }
+        ]
       },
-      "live_interval_proactive": {
-        "type": "bool",
-        "description": "定时模式允许主动发言",
-        "default": true,
-        "hint": "仅定时模式使用；提问模式只回答用户，变化模式允许主动评论。定时和变化模式会自动观察，需要回应时才发言。",
-        "condition": {
-          "live_enabled": true
-        }
+      "camera": {
+        "type": "template_list",
+        "description": "摄像头预设",
+        "hint": "用于 /live 摄像头。保留近期动作和状态变化的代表画面。 每种模式只保留一项，删除后使用该模式的默认预设，可从添加条目恢复。",
+        "templates": {
+          "demand": {
+            "name": "提问",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 960,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 4,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 2,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              }
+            }
+          },
+          "interval": {
+            "name": "定时",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 960,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 4,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 10,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "observation_interval": {
+                "type": "float",
+                "description": "观察间隔（秒）",
+                "default": 10.0,
+                "hint": "0.2～300秒。定时调用模型观察的间隔，是否发言由模型和主动发言设置决定。"
+              },
+              "proactive": {
+                "type": "bool",
+                "description": "允许主动发言",
+                "default": true,
+                "hint": "关闭后仍在后台观察；用户提问时才回答。"
+              }
+            }
+          },
+          "change": {
+            "name": "变化",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 0.5,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 960,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 5,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 4,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "sensitivity": {
+                "type": "string",
+                "description": "变化灵敏度",
+                "default": "medium",
+                "hint": "low低、medium中、high高；只决定是否需要观察，是否回应由模型判断。",
+                "options": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "min_analysis_interval": {
+                "type": "float",
+                "description": "最短观察间隔（秒）",
+                "default": 5.0,
+                "hint": "0.2～300秒。合并连续变化，限制模型调用频率。"
+              }
+            }
+          }
+        },
+        "default": [
+          {
+            "__template_key": "demand",
+            "sample_interval": 1.0,
+            "max_edge": 960,
+            "max_frames": 4,
+            "lookback_seconds": 2
+          },
+          {
+            "__template_key": "interval",
+            "sample_interval": 1.0,
+            "max_edge": 960,
+            "max_frames": 4,
+            "lookback_seconds": 10,
+            "observation_interval": 10.0,
+            "proactive": true
+          },
+          {
+            "__template_key": "change",
+            "sample_interval": 0.5,
+            "max_edge": 960,
+            "max_frames": 5,
+            "lookback_seconds": 4,
+            "sensitivity": "medium",
+            "min_analysis_interval": 5.0
+          }
+        ]
       },
-      "live_camera_device": {
-        "type": "string",
-        "description": "摄像头设备",
-        "default": "",
-        "hint": "留空自动使用默认设备。Linux如 /dev/video0；Windows为DirectShow名称；macOS为AVFoundation设备索引或名称。",
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_audio_device": {
-        "type": "string",
-        "description": "本机音频设备",
-        "default": "",
-        "hint": "Linux留空：屏幕取默认播放回环、摄像头取默认麦克风（需要parec）；Windows填写DirectShow音频设备名称；macOS摄像头默认麦克风0，屏幕需配置回环设备索引。ASR复用现有配置。",
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_buffer_seconds": {
-        "type": "float",
-        "description": "实时缓冲秒数",
-        "default": 60,
-        "hint": "最多300秒，同时有帧数和内存上限；不永久保存画面。",
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_session_seconds": {
-        "type": "float",
-        "description": "单次会话有效期（秒）",
-        "default": 1800,
-        "hint": "到期自动停止，最多4小时；同时最多4个会话。",
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_min_analysis_interval": {
-        "type": "float",
-        "description": "后台分析最短间隔（秒）",
-        "default": 5,
-        "hint": "变化候选合并处理，防止切镜头或连续运动造成调用积压。",
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_speech_cooldown": {
-        "type": "float",
-        "description": "主动发言冷却时间（秒）",
-        "default": 15,
-        "condition": {
-          "live_enabled": true
-        }
-      },
-      "live_max_analyses": {
-        "type": "int",
-        "description": "单会话模型分析次数上限",
-        "default": 120,
-        "hint": "独立于离线视频每日额度；包含后台观察和 live_observe。直传时主模型看图并决定回复或沉默；启用独立看图模型时，主动发言还需一次主模型调用。",
-        "condition": {
-          "live_enabled": true
-        }
+      "stream": {
+        "type": "template_list",
+        "description": "媒体 URL 预设",
+        "hint": "用于 /live 媒体URL。保留近期片段与关键变化；可按视频、监控或桌面流内容调整。 每种模式只保留一项，删除后使用该模式的默认预设，可从添加条目恢复。",
+        "templates": {
+          "demand": {
+            "name": "提问",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1280,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 4,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 4,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              }
+            }
+          },
+          "interval": {
+            "name": "定时",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 1.0,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1280,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 4,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 10,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "observation_interval": {
+                "type": "float",
+                "description": "观察间隔（秒）",
+                "default": 10.0,
+                "hint": "0.2～300秒。定时调用模型观察的间隔，是否发言由模型和主动发言设置决定。"
+              },
+              "proactive": {
+                "type": "bool",
+                "description": "允许主动发言",
+                "default": true,
+                "hint": "关闭后仍在后台观察；用户提问时才回答。"
+              }
+            }
+          },
+          "change": {
+            "name": "变化",
+            "items": {
+              "sample_interval": {
+                "type": "float",
+                "description": "采样间隔（秒）",
+                "default": 0.5,
+                "hint": "0.2～30秒。采集画面的间隔，不是调用模型的间隔。"
+              },
+              "max_edge": {
+                "type": "int",
+                "description": "图片长边上限（像素）",
+                "default": 1280,
+                "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
+              },
+              "max_frames": {
+                "type": "int",
+                "description": "单次图片数量上限",
+                "default": 6,
+                "hint": "1～32张。选择代表画面并保留最新画面，不用重复图片凑满数量。"
+              },
+              "lookback_seconds": {
+                "type": "float",
+                "description": "取帧时间范围（秒）",
+                "default": 6,
+                "hint": "0～300秒；0只取最新画面。每次从最近这段时间选择图片，受缓冲保留时长限制；live_observe 可指定本次范围。"
+              },
+              "sensitivity": {
+                "type": "string",
+                "description": "变化灵敏度",
+                "default": "medium",
+                "hint": "low低、medium中、high高；只决定是否需要观察，是否回应由模型判断。",
+                "options": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "min_analysis_interval": {
+                "type": "float",
+                "description": "最短观察间隔（秒）",
+                "default": 5.0,
+                "hint": "0.2～300秒。合并连续变化，限制模型调用频率。"
+              }
+            }
+          }
+        },
+        "default": [
+          {
+            "__template_key": "demand",
+            "sample_interval": 1.0,
+            "max_edge": 1280,
+            "max_frames": 4,
+            "lookback_seconds": 4
+          },
+          {
+            "__template_key": "interval",
+            "sample_interval": 1.0,
+            "max_edge": 1280,
+            "max_frames": 4,
+            "lookback_seconds": 10,
+            "observation_interval": 10.0,
+            "proactive": true
+          },
+          {
+            "__template_key": "change",
+            "sample_interval": 0.5,
+            "max_edge": 1280,
+            "max_frames": 6,
+            "lookback_seconds": 6,
+            "sensitivity": "medium",
+            "min_analysis_interval": 5.0
+          }
+        ]
       }
     }
   },

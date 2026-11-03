@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from astrbot_plugin_vision.config import Settings
+from astrbot_plugin_vision.config import LIVE_MODES, LIVE_SOURCES, Settings
 from astrbot_plugin_vision.live import (
     MAX_FRAMES,
     LiveOptions,
@@ -72,14 +72,18 @@ def test_live_resolution_config_is_independent(max_edge):
             "runtime_cache": {"max_edge_limit": 1024},
         }
     )
-    assert settings.live_max_edge == max_edge
+    assert all(
+        settings.live_preset(source, mode).max_edge == max_edge
+        for source in LIVE_SOURCES
+        for mode in LIVE_MODES
+    )
     assert settings.overview_max_edge == 640
     assert settings.max_edge_limit == 1024
 
 
 @pytest.mark.parametrize("max_edge", [63, 4097, True, 1280.5, "1280"])
 def test_invalid_live_resolution_config_rejected(max_edge):
-    with pytest.raises(ValueError, match="live_max_edge"):
+    with pytest.raises(ValueError, match="max_edge"):
         Settings.from_mapping({"live": {"live_max_edge": max_edge}})
 
 
@@ -87,7 +91,10 @@ def test_invalid_live_resolution_config_rejected(max_edge):
     "mode,max_edge", [("demand", 1920), ("interval", 640), ("change", 960)]
 )
 async def test_live_resolution_reaches_buffer_and_model(live, mode, max_edge):
-    live.settings = replace(live.settings, live_max_edge=max_edge, max_edge_limit=1024)
+    presets = Settings.from_mapping(
+        {"live": {"screen": {mode: {"max_edge": max_edge}}}}
+    ).live_presets
+    live.settings = replace(live.settings, live_presets=presets, max_edge_limit=1024)
     session = await setup_session(live, mode=mode)
     await live.add_frame(session, picture(size=(2560, 1440)), 0)
     expected = (max_edge, max_edge * 9 // 16)
@@ -466,21 +473,35 @@ def test_fenced_model_json_accepted():
     ],
 )
 def test_command_uses_configuration_and_preserves_instruction(source, expected):
-    settings = replace(
-        Settings(),
-        live_sensitivity="high",
-        live_observation_interval=20,
-        asr_enabled=True,
-        asr_provider_id="existing-asr",
-        live_interval_proactive=False,
+    settings = Settings.from_mapping(
+        {
+            "asr_enabled": True,
+            "asr_provider_id": "existing-asr",
+            "live": {
+                expected: {
+                    "interval": {
+                        "observation_interval": 20,
+                        "proactive": False,
+                        "sample_interval": 2,
+                        "max_edge": 1920,
+                        "max_frames": 3,
+                        "lookback_seconds": 8,
+                    }
+                }
+            },
+        }
     )
     options, url = parse_live_command(source + " 定时 look at this，不要剧透", settings)
     assert options["source"] == expected
     assert options["focus"] == "look at this，不要剧透"
     assert options["interval"] == 20
-    assert options["sensitivity"] == "high"
     assert options["audio"] is True
     assert options["proactive"] is False
+    effective = LiveOptions.parse(options, settings)
+    assert effective.sample_interval == 2
+    assert effective.max_edge == 1920
+    assert effective.max_frames == 3
+    assert effective.lookback_seconds == 8
     assert url == (source if expected == "stream" else "")
 
 

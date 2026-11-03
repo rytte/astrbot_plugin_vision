@@ -17,6 +17,7 @@ from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.star.filter.command import CommandFilter
+from astrbot_plugin_vision.config import Settings
 from astrbot_plugin_vision.live import decode_frame
 from astrbot_plugin_vision.live_reply import LiveReplyRoute
 from astrbot_plugin_vision.main import VisionPlugin
@@ -63,8 +64,21 @@ async def test_command_starts_direct_capture_and_end_cancels(
     plugin.settings = replace(
         plugin.settings,
         live_enabled=True,
-        live_sensitivity="high",
-        live_observation_interval=20,
+        live_presets=Settings.from_mapping(
+            {
+                "live": {
+                    "screen": {
+                        expected: (
+                            {"sensitivity": "high", "min_analysis_interval": 20}
+                            if expected == "change"
+                            else {"observation_interval": 20}
+                            if expected == "interval"
+                            else {}
+                        )
+                    }
+                }
+            }
+        ).live_presets,
     )
     plugin.live_sessions.settings = plugin.settings
     started = asyncio.Event()
@@ -84,8 +98,11 @@ async def test_command_starts_direct_capture_and_end_cancels(
     assert started.is_set()
     session = plugin.live_sessions.for_chat(event.unified_msg_origin, "alice")
     assert session.options.focus == "keep watching with me"
-    assert session.options.sensitivity == "high"
-    assert session.options.interval == 20
+    if mode == "变化":
+        assert session.options.sensitivity == "high"
+        assert session.options.min_analysis_interval == 20
+    if mode == "定时":
+        assert session.options.interval == 20
     assert session.options.mode == expected
     assert session.options.proactive is (mode != "提问")
     results = await collect(plugin.live_command(event, "end"))
@@ -101,6 +118,35 @@ async def test_command_parser_keeps_entire_observation_instruction():
         ["屏幕", "提问", "keep", "watching", "with", "me"], command.handler_params
     )
     assert params["arguments"] == "屏幕 提问 keep watching with me"
+
+
+@pytest.mark.parametrize("lookback,expected", [(None, [6, 9]), (0, [9]), (10, [0, 9])])
+async def test_live_observe_uses_preset_window_and_allows_call_override(
+    plugin, lookback, expected
+):
+    plugin.settings = replace(
+        plugin.settings,
+        overview_model_enabled=True,
+        overview_provider_id="vision",
+        live_presets=Settings.from_mapping(
+            {"live": {"screen": {"demand": {"max_frames": 2, "lookback_seconds": 4}}}}
+        ).live_presets,
+    )
+    manager = plugin.live_sessions
+    manager.settings = plugin.settings
+    manager.analyze = AsyncMock(return_value={"summary": "画面", "speak": False})
+    event = PlatformEvent()
+    session = await manager.create(event.unified_msg_origin, "alice")
+    manager.configure(session, {"source": "screen", "mode": "demand"})
+    try:
+        for timestamp, color in zip(
+            (0, 3, 6, 9), ((255, 0, 0), (0, 0, 255), (0, 255, 0), (255, 255, 0))
+        ):
+            await manager.add_frame(session, picture(color), timestamp)
+        await plugin.live_observe(event, "现在发生了什么", lookback_sec=lookback)
+        assert session.observation["evidence_times"] == expected
+    finally:
+        await manager.close()
 
 
 async def test_failed_capture_cleans_session_and_non_admin_cannot_start(

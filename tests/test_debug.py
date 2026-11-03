@@ -39,6 +39,17 @@ async def sessions(tmp_path):
     await manager.close()
 
 
+async def test_debug_settings_preserve_realtime_presets(sessions):
+    settings = Settings.from_mapping(
+        {"live": {"camera": {"change": {"sample_interval": 2, "max_frames": 7}}}}
+    )
+    sessions.media.settings = settings
+    modified = sessions.settings({"overview_interval": 3})
+    assert modified.overview_interval == 3
+    assert modified.live_presets == settings.live_presets
+    assert sessions.media.settings.overview_interval == 4
+
+
 async def test_real_debug_steps_preview_and_isolation(sessions, sample_video):
     source_bytes = sample_video.read_bytes()
     session = await sessions.upload("admin", Upload(source_bytes, "../../test.mp4"))

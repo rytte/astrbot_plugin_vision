@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import re
 import shutil
@@ -49,6 +50,8 @@ async def device_listing(ffmpeg: str, backend: str) -> str:
 
 async def capture_input(session: LiveSession, settings, ffmpeg: str) -> CaptureInput:
     source = session.options.source
+    # 本机输入至少每秒一帧，确保低频预设也能尽快输出首帧。
+    input_fps = str(max(1, math.ceil(1 / session.options.sample_interval)))
     if source == "stream":
         if not session.source_url:
             raise VideoError("缺少直播媒体直链")
@@ -69,7 +72,7 @@ async def capture_input(session: LiveSession, settings, ffmpeg: str) -> CaptureI
                 raise VideoError(
                     "本机屏幕采集需要可访问的 X11 桌面；无桌面的服务器或纯 Wayland 会话请使用媒体URL"
                 )
-            video = ("-f", "x11grab", "-framerate", "1", "-i", display)
+            video = ("-f", "x11grab", "-framerate", input_fps, "-i", display)
         else:
             video = ("-f", "v4l2", "-i", camera or "/dev/video0")
         # 优先复用系统 PulseAudio/PipeWire 录音工具，不要求 FFmpeg 编译 pulse。
@@ -97,7 +100,7 @@ async def capture_input(session: LiveSession, settings, ffmpeg: str) -> CaptureI
         return CaptureInput(video, audio_command, True)
     if sys.platform == "win32":
         if source == "screen":
-            video = ("-f", "gdigrab", "-framerate", "1", "-i", "desktop")
+            video = ("-f", "gdigrab", "-framerate", input_fps, "-i", "desktop")
         else:
             if not camera:
                 devices = await device_listing(ffmpeg, "dshow")
@@ -120,7 +123,10 @@ async def capture_input(session: LiveSession, settings, ffmpeg: str) -> CaptureI
             device = match.group(1)
         else:
             device = camera or "0"
-        video = ("-f", "avfoundation", "-framerate", "1", "-i", device + ":none")
+        video = ("-f", "avfoundation")
+        if source == "screen":
+            video += ("-framerate", input_fps)
+        video += ("-i", device + ":none")
         audio_input = audio or ("0" if source == "camera" else "")
         return CaptureInput(
             video,
@@ -138,7 +144,9 @@ async def read_capture(
     started = time.monotonic()
     try:
         incoming = await capture_input(session, sessions.settings, ffmpeg)
-        max_edge = sessions.settings.live_max_edge
+        options = session.options
+        max_edge = options.max_edge
+        fps = format(1 / options.sample_interval, ".10g")
         video_process = await asyncio.create_subprocess_exec(
             ffmpeg,
             "-nostdin",
@@ -147,7 +155,7 @@ async def read_capture(
             *incoming.video,
             "-an",
             "-vf",
-            f"fps=1,scale='min(iw,{max_edge})':'min(ih,{max_edge})':"
+            f"fps={fps}:round=up:start_time=0,scale='min(iw,{max_edge})':'min(ih,{max_edge})':"
             "force_original_aspect_ratio=decrease",
             "-threads",
             "1",
@@ -222,7 +230,9 @@ async def read_capture(
             audio_task = asyncio.create_task(audio_loop())
         pending = bytearray()
         while not session.stopped:
-            part = await asyncio.wait_for(video_process.stdout.read(65536), 15)
+            part = await asyncio.wait_for(
+                video_process.stdout.read(65536), max(15, options.fresh_seconds)
+            )
             if not part:
                 raise VideoError("画面来源已结束或无法读取")
             pending.extend(part)

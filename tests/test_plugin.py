@@ -194,10 +194,13 @@ def test_configuration_schema_matches_defaults(tmp_path):
         assert tuple(schema[group]["items"]) == keys
         for item in schema[group]["items"].values():
             assert set(item.get("condition", {})).issubset(keys)
+    live_schema = schema.pop("live")["items"]
     schema = {
         key: item for group in schema.values() for key, item in group["items"].items()
     }
-    assert set(schema) == {field.name for field in fields(Settings)}
+    for group in ("general", "devices"):
+        schema.update(live_schema[group]["items"])
+    assert set(schema) == {field.name for field in fields(Settings)} - {"live_presets"}
     assert "allowed_video_roots" not in schema
     assert schema["overview_provider_id"]["_special"] == "select_provider"
     assert schema["overview_provider_id"]["default"] == ""

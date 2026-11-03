@@ -9,7 +9,7 @@ import json
 import shutil
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 from PIL import Image
@@ -115,7 +115,12 @@ class DebugSessions:
             raise ValueError(
                 "仅支持本次概览间隔、帧数预算、输出尺寸、场景阈值和图片输出模式"
             )
-        return Settings.from_mapping({**asdict(self.media.settings), **values})
+        data = asdict(self.media.settings)
+        data.pop("live_presets")
+        return replace(
+            Settings.from_mapping({**data, **values}),
+            live_presets=self.media.settings.live_presets,
+        )
 
     def _active(self, session: DebugSession) -> None:
         if self.closed or self.sessions.get(session.id) is not session:
