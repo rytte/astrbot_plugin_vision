@@ -29,7 +29,7 @@ from mcp.types import CallToolResult, TextContent
 
 from .agent_images import ToolImageBuffer, defer_tool_images
 from .asr import VideoASR
-from .config import Settings, migrate_live_config, migrate_live_config_file
+from .config import Settings, migrate_config, migrate_config_file
 from .debug import DebugSessions
 from .debug_web import DebugWeb
 from .downloads import VideoDownloads
@@ -75,10 +75,10 @@ VIDEO_SUFFIXES = {
 
 # AstrBot 先导入插件，再加载 schema；构造函数才迁移会丢失已被删除的旧字段。
 if __name__.startswith("data.plugins."):
-    if migrate_live_config_file(
+    if migrate_config_file(
         Path(get_astrbot_config_path()) / f"{Path(__file__).parent.name}_config.json"
     ):
-        logger.info("实时视觉配置已迁移为来源与响应模式预设，原配置已备份")
+        logger.info("插件配置已迁移至新分组，原配置已备份")
 
 
 class VisionPlugin(Star):
@@ -86,7 +86,7 @@ class VisionPlugin(Star):
 
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         super().__init__(context)
-        normalized = migrate_live_config(config or {})
+        normalized = migrate_config(config or {})
         self.settings = Settings.from_mapping(normalized)
         if (
             config is not None

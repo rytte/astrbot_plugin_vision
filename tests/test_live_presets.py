@@ -12,8 +12,8 @@ from astrbot_plugin_vision.config import (
     LIVE_PRESET_FIELDS,
     LIVE_SOURCES,
     Settings,
+    migrate_config_file,
     migrate_live_config,
-    migrate_live_config_file,
 )
 from astrbot_plugin_vision.live import (
     LiveSessions,
@@ -174,8 +174,8 @@ def test_legacy_config_migrates_before_astrbot_loads_schema(tmp_path, grouped):
     }
     path.write_text(json.dumps({"live": legacy} if grouped else legacy))
     original = path.read_bytes()
-    assert migrate_live_config_file(path)
-    assert not migrate_live_config_file(path)
+    assert migrate_config_file(path)
+    assert not migrate_config_file(path)
     assert next(tmp_path.glob("*.bak")).read_bytes() == original
     schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
     config = AstrBotConfig(str(path), schema=schema)
@@ -199,7 +199,7 @@ def test_invalid_legacy_config_is_not_overwritten(tmp_path):
     path.write_text('{"live": {"live_max_edge": 30}}')
     original = path.read_bytes()
     with pytest.raises(ValueError, match="max_edge"):
-        migrate_live_config_file(path)
+        migrate_config_file(path)
     assert path.read_bytes() == original
     assert not list(tmp_path.glob("*.bak"))
 
@@ -217,7 +217,7 @@ def test_fixed_preset_objects_migrate_to_native_template_lists(tmp_path):
     path = tmp_path / "fixed.json"
     path.write_text(json.dumps(original))
     before = Settings.from_mapping(original)
-    assert migrate_live_config_file(path)
+    assert migrate_config_file(path)
     migrated = json.loads(path.read_text())
     assert migrate_live_config(migrated) == migrated
     schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())

@@ -82,7 +82,7 @@ class LivePreset:
 
 
 def default_live_presets():
-    sizes = {"screen": 1600, "camera": 960, "stream": 1280}
+    sizes = {"screen": 1600, "camera": 768, "stream": 640}
     frames = {"screen": (4, 2, 3), "camera": (4, 4, 5), "stream": (4, 4, 6)}
     windows = {"screen": (0, 10, 4), "camera": (2, 10, 4), "stream": (4, 10, 6)}
     return {
@@ -191,18 +191,92 @@ def migrate_live_config(values: Mapping) -> dict:
     return values
 
 
-def migrate_live_config_file(path: Path) -> bool:
+VIDEO_CONFIG_GROUPS = {
+    "overview": (
+        "overview_interval",
+        "overview_output_mode",
+        "overview_max_frames",
+        "overview_max_edge",
+        "scene_threshold",
+    ),
+    "inspect": ("inspect_max_frames", "inspect_max_edge", "inspect_max_calls"),
+    "video_limits": ("download_max_mb", "download_max_duration"),
+    "share_video": (
+        "share_links_enabled",
+        "download_cache_max_mb",
+        "download_cookie_file",
+        "download_allow_fake_ip",
+    ),
+    "user_quota": ("daily_analysis_limit",),
+    "runtime_cache": ("max_edge_limit", "cache_ttl", "cache_max_mb"),
+}
+CONFIG_GROUPS = {
+    "dependencies": ("ffmpeg_path", "ffprobe_path"),
+    "model_enhancement": (
+        "overview_model_enabled",
+        "overview_provider_id",
+        "asr_enabled",
+        "asr_provider_id",
+    ),
+    "general": ("tool_timeout", "max_concurrency"),
+    "video_analysis": tuple(VIDEO_CONFIG_GROUPS),
+    "live": ("general", "devices", *LIVE_SOURCES),
+}
+
+
+def config_section(values: Mapping, key: str, path: str) -> dict:
+    section = values.get(key, {})
+    if not isinstance(section, Mapping):
+        raise ValueError(f"{path} 必须是配置对象")
+    return dict(section)
+
+
+def migrate_config(values: Mapping) -> dict:
+    """归并旧分组与平铺配置，已在新位置设置的值优先；不修改调用方对象。"""
+    values = migrate_live_config(values)
+    video = config_section(values, "video_analysis", "video_analysis")
+    general = config_section(values, "general", "general")
+    for group, keys in VIDEO_CONFIG_GROUPS.items():
+        section = {
+            **config_section(values, group, group),
+            **config_section(video, group, f"video_analysis.{group}"),
+        }
+        if group == "runtime_cache":
+            for key in CONFIG_GROUPS["general"]:
+                if key in section:
+                    general.setdefault(key, section.pop(key))
+        for key in keys:
+            if key in values:
+                section.setdefault(key, values.pop(key))
+        if section or group in values or group in video:
+            video[group] = section
+        values.pop(group, None)
+    if video or "video_analysis" in values:
+        values["video_analysis"] = video
+    if general or "general" in values:
+        values["general"] = general
+    for group in ("dependencies", "model_enhancement", "general"):
+        section = config_section(values, group, group)
+        for key in CONFIG_GROUPS[group]:
+            if key in values:
+                section.setdefault(key, values.pop(key))
+        if section or group in values:
+            values[group] = section
+    return values
+
+
+def migrate_config_file(path: Path) -> bool:
     """在 AstrBot 按新 schema 加载配置前迁移原文件，保留备份并原子替换。"""
     if not path.is_file():
         return False
     original = path.read_bytes()
     values = json.loads(original.decode("utf-8-sig"))
-    migrated = migrate_live_config(values)
+    migrated = migrate_config(values)
+    Settings.from_mapping(migrated)
     if migrated == values:
         return False
-    Settings.from_mapping(migrated)
     digest = hashlib.sha256(original).hexdigest()[:12]
-    backup = path.with_name(f"{path.name}.live-presets-{digest}.bak")
+    backup = path.with_name(f"{path.name}.config-groups-{digest}.bak")
     if not backup.exists():
         with backup.open("xb") as file:
             os.chmod(backup, path.stat().st_mode & 0o777)
@@ -219,41 +293,6 @@ def migrate_live_config_file(path: Path) -> bool:
     finally:
         Path(name).unlink(missing_ok=True)
     return True
-
-
-CONFIG_GROUPS = {
-    "dependencies": ("ffmpeg_path", "ffprobe_path"),
-    "video_limits": ("download_max_mb", "download_max_duration"),
-    "user_quota": ("daily_analysis_limit",),
-    "share_video": (
-        "share_links_enabled",
-        "download_cache_max_mb",
-        "download_cookie_file",
-        "download_allow_fake_ip",
-    ),
-    "model_enhancement": (
-        "overview_model_enabled",
-        "overview_provider_id",
-        "asr_enabled",
-        "asr_provider_id",
-    ),
-    "overview": (
-        "overview_interval",
-        "overview_output_mode",
-        "overview_max_frames",
-        "overview_max_edge",
-        "scene_threshold",
-    ),
-    "inspect": ("inspect_max_frames", "inspect_max_edge", "inspect_max_calls"),
-    "live": ("general", "devices", *LIVE_SOURCES),
-    "runtime_cache": (
-        "max_edge_limit",
-        "tool_timeout",
-        "max_concurrency",
-        "cache_ttl",
-        "cache_max_mb",
-    ),
-}
 
 
 @dataclass(frozen=True)
@@ -302,7 +341,7 @@ class Settings:
     @classmethod
     def from_mapping(cls, values: Mapping) -> Settings:
         defaults = cls()
-        values = migrate_live_config(values)
+        values = migrate_config(values)
         live = values.pop("live", {})
         unknown = set(live) - set(CONFIG_GROUPS["live"])
         if unknown:
@@ -329,6 +368,19 @@ class Settings:
                     mode,
                     f"live.{source}.{mode}",
                 )
+        video = values.pop("video_analysis", {})
+        unknown = set(video) - set(VIDEO_CONFIG_GROUPS)
+        if unknown:
+            raise ValueError("未知视频分析配置：" + ", ".join(sorted(unknown)))
+        for group, keys in VIDEO_CONFIG_GROUPS.items():
+            section = video.get(group, {})
+            unknown = set(section) - set(keys)
+            if unknown:
+                raise ValueError(
+                    f"未知视频分析配置 video_analysis.{group}："
+                    + ", ".join(sorted(unknown))
+                )
+            values.update(section)
         for group, keys in CONFIG_GROUPS.items():
             if group not in values:
                 continue

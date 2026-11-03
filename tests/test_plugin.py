@@ -37,7 +37,7 @@ from astrbot.core.star.star_handler import star_handlers_registry
 from astrbot.core.star.star_manager import PluginManager
 from astrbot.dashboard.services.plugin_service import PluginService
 from astrbot_plugin_vision.agent_images import ToolImageBuffer
-from astrbot_plugin_vision.config import CONFIG_GROUPS, Settings
+from astrbot_plugin_vision.config import CONFIG_GROUPS, VIDEO_CONFIG_GROUPS, Settings
 from astrbot_plugin_vision.main import VisionPlugin
 from astrbot_plugin_vision.media import VideoError
 from astrbot_plugin_vision.quota import BEIJING_TZ, DailyQuota
@@ -195,6 +195,13 @@ def test_configuration_schema_matches_defaults(tmp_path):
         for item in schema[group]["items"].values():
             assert set(item.get("condition", {})).issubset(keys)
     live_schema = schema.pop("live")["items"]
+    video_schema = schema.pop("video_analysis")["items"]
+    for group, keys in VIDEO_CONFIG_GROUPS.items():
+        assert video_schema[group]["type"] == "object"
+        assert tuple(video_schema[group]["items"]) == keys
+        for item in video_schema[group]["items"].values():
+            assert set(item.get("condition", {})).issubset(keys)
+    schema.update(video_schema)
     schema = {
         key: item for group in schema.values() for key, item in group["items"].items()
     }
@@ -230,18 +237,20 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
     )
     config_path = str(tmp_path / "grouped_config.json")
     config = AstrBotConfig(config_path, schema=schema)
-    config["video_limits"].update(download_max_mb=50, download_max_duration=90)
-    config["user_quota"]["daily_analysis_limit"] = 8
-    config["share_video"].update(share_links_enabled=False, download_cache_max_mb=256)
+    video = config["video_analysis"]
+    video["video_limits"].update(download_max_mb=50, download_max_duration=90)
+    video["user_quota"]["daily_analysis_limit"] = 8
+    video["share_video"].update(share_links_enabled=False, download_cache_max_mb=256)
     config["model_enhancement"].update(
         overview_model_enabled=True,
         overview_provider_id="configured-vision",
         asr_enabled=True,
         asr_provider_id="configured-asr",
     )
-    config["overview"].update(overview_output_mode="grid", overview_interval=2)
-    config["inspect"]["inspect_max_calls"] = 5
-    config["runtime_cache"]["tool_timeout"] = 120
+    video["overview"].update(overview_output_mode="grid", overview_interval=2)
+    video["inspect"]["inspect_max_calls"] = 5
+    video["runtime_cache"]["cache_ttl"] = 1800
+    config["general"].update(tool_timeout=120, max_concurrency=3)
     config.save_config()
     reloaded = AstrBotConfig(config_path, schema=schema)
     configured = VisionPlugin(plugin.context, reloaded)
@@ -261,6 +270,8 @@ async def test_grouped_config_survives_astrbot_save_and_load(plugin, tmp_path):
             overview_interval=2,
             inspect_max_calls=5,
             tool_timeout=120,
+            max_concurrency=3,
+            cache_ttl=1800,
         )
         assert reloaded == config
     finally:

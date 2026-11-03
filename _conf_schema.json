@@ -16,75 +16,6 @@
       }
     }
   },
-  "video_limits": {
-    "type": "object",
-    "description": "视频限制",
-    "items": {
-      "download_max_mb": {
-        "type": "int",
-        "description": "视频大小上限（MB）",
-        "hint": "适用于直接附件和分享视频。附件接收后检查，超限时不处理。",
-        "default": 200
-      },
-      "download_max_duration": {
-        "type": "float",
-        "description": "视频时长上限（秒）",
-        "hint": "适用于直接附件和分享视频，超限时不处理。",
-        "default": 1800
-      }
-    }
-  },
-  "user_quota": {
-    "type": "object",
-    "description": "用户额度",
-    "items": {
-      "daily_analysis_limit": {
-        "type": "int",
-        "description": "普通用户每日分析次数上限",
-        "hint": "正整数，默认每天 5 次；按北京时间每天 00:00 重置。同一平台用户跨群聊、私聊共享额度，同一条消息中的概览和回看只计一次。管理员免除此每日限制；重启或重载保留当日用量。",
-        "default": 5
-      }
-    }
-  },
-  "share_video": {
-    "type": "object",
-    "description": "分享链接解析",
-    "items": {
-      "share_links_enabled": {
-        "type": "bool",
-        "description": "启用分享链接视频解析",
-        "hint": "识别文本、分享卡片和引用中的链接，调用概览时才使用 yt-dlp 下载。",
-        "default": true
-      },
-      "download_cache_max_mb": {
-        "type": "int",
-        "description": "分享视频缓存容量（MB）",
-        "hint": "仅管理通过分享链接下载的视频；空闲时清理，闲置期限沿用 cache_ttl。",
-        "default": 1024,
-        "condition": {
-          "share_links_enabled": true
-        }
-      },
-      "download_cookie_file": {
-        "type": "string",
-        "description": "yt-dlp Cookie 文件路径",
-        "hint": "可选，填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径。抖音公开视频会自动获取匿名访问凭据，通常无需填写；需要登录或触发风控时可尝试配置有效的浏览器 Cookie。",
-        "default": "",
-        "condition": {
-          "share_links_enabled": true
-        }
-      },
-      "download_allow_fake_ip": {
-        "type": "bool",
-        "description": "兼容本机代理 Fake-IP DNS",
-        "hint": "仅在代理使用 198.18.0.0/15 虚拟 DNS 时开启；仍拒绝其他内网地址和直接 Fake-IP 链接。",
-        "default": false,
-        "condition": {
-          "share_links_enabled": true
-        }
-      }
-    }
-  },
   "model_enhancement": {
     "type": "object",
     "description": "模型与语音",
@@ -123,67 +54,181 @@
       }
     }
   },
-  "overview": {
+  "general": {
     "type": "object",
-    "description": "概览抽帧",
+    "description": "通用设置",
     "items": {
-      "overview_interval": {
+      "tool_timeout": {
         "type": "float",
-        "description": "概览默认采样间隔（秒）",
-        "default": 4
+        "description": "单次工具调用总超时（秒）",
+        "default": 300
       },
-      "overview_output_mode": {
-        "type": "string",
-        "description": "概览图片输出模式",
-        "options": [
-          "frames",
-          "grid"
-        ],
-        "labels": [
-          "独立帧",
-          "九宫格"
-        ],
-        "hint": "独立帧逐张输出；九宫格按时间顺序每组最多 9 帧，无损拼接且不额外缩放。仅影响概览，回看仍用独立帧；不保证节省视觉 token。",
-        "default": "frames"
-      },
-      "overview_max_frames": {
+      "max_concurrency": {
         "type": "int",
-        "description": "概览总帧数上限",
-        "hint": "包含固定、边界和变化帧。超预算增大间隔，不截掉后半段。注意模型自身的图片数量和上下文限制。",
-        "default": 200
-      },
-      "overview_max_edge": {
-        "type": "int",
-        "description": "概览图片长边上限（像素）",
-        "default": 640
-      },
-      "scene_threshold": {
-        "type": "float",
-        "description": "场景变化阈值",
-        "hint": "0～1，越低越敏感。变化候选不等于语义重要帧。",
-        "default": 0.3
+        "description": "并发处理与子进程数量上限",
+        "default": 2
       }
     }
   },
-  "inspect": {
+  "video_analysis": {
     "type": "object",
-    "description": "详细回看",
+    "description": "视频分析",
     "items": {
-      "inspect_max_frames": {
-        "type": "int",
-        "description": "单次回看帧数上限",
-        "default": 8
+      "overview": {
+        "type": "object",
+        "description": "视频概览",
+        "items": {
+          "overview_interval": {
+            "type": "float",
+            "description": "概览默认采样间隔（秒）",
+            "default": 4
+          },
+          "overview_output_mode": {
+            "type": "string",
+            "description": "概览图片输出模式",
+            "options": [
+              "frames",
+              "grid"
+            ],
+            "labels": [
+              "独立帧",
+              "九宫格"
+            ],
+            "hint": "独立帧逐张输出；九宫格按时间顺序每组最多 9 帧，无损拼接且不额外缩放。仅影响概览，回看仍用独立帧；不保证节省视觉 token。",
+            "default": "frames"
+          },
+          "overview_max_frames": {
+            "type": "int",
+            "description": "概览总帧数上限",
+            "hint": "包含固定、边界和变化帧。超预算增大间隔，不截掉后半段。注意模型自身的图片数量和上下文限制。",
+            "default": 200
+          },
+          "overview_max_edge": {
+            "type": "int",
+            "description": "概览图片长边上限（像素）",
+            "default": 640
+          },
+          "scene_threshold": {
+            "type": "float",
+            "description": "场景变化阈值",
+            "hint": "0～1，越低越敏感。变化候选不等于语义重要帧。",
+            "default": 0.3
+          }
+        }
       },
-      "inspect_max_edge": {
-        "type": "int",
-        "description": "回看默认图片长边（像素）",
-        "default": 768
+      "inspect": {
+        "type": "object",
+        "description": "详细回看",
+        "items": {
+          "inspect_max_frames": {
+            "type": "int",
+            "description": "单次回看帧数上限",
+            "default": 8
+          },
+          "inspect_max_edge": {
+            "type": "int",
+            "description": "回看默认图片长边（像素）",
+            "default": 768
+          },
+          "inspect_max_calls": {
+            "type": "int",
+            "description": "单个问题的回看次数上限",
+            "hint": "同一问题中所有视频共享次数；参数校验失败返还次数，处理失败或超时仍计入；新消息重新计数。",
+            "default": 3
+          }
+        }
       },
-      "inspect_max_calls": {
-        "type": "int",
-        "description": "单个问题的回看次数上限",
-        "hint": "同一问题中所有视频共享次数；参数校验失败返还次数，处理失败或超时仍计入；新消息重新计数。",
-        "default": 3
+      "video_limits": {
+        "type": "object",
+        "description": "视频限制",
+        "items": {
+          "download_max_mb": {
+            "type": "int",
+            "description": "视频大小上限（MB）",
+            "hint": "适用于直接附件和分享视频。附件接收后检查，超限时不处理。",
+            "default": 200
+          },
+          "download_max_duration": {
+            "type": "float",
+            "description": "视频时长上限（秒）",
+            "hint": "适用于直接附件和分享视频，超限时不处理。",
+            "default": 1800
+          }
+        }
+      },
+      "share_video": {
+        "type": "object",
+        "description": "分享视频",
+        "items": {
+          "share_links_enabled": {
+            "type": "bool",
+            "description": "启用分享链接视频解析",
+            "hint": "识别文本、分享卡片和引用中的链接，调用概览时才使用 yt-dlp 下载。",
+            "default": true
+          },
+          "download_cache_max_mb": {
+            "type": "int",
+            "description": "分享视频缓存容量（MB）",
+            "hint": "仅管理通过分享链接下载的视频；空闲时清理，闲置期限沿用 cache_ttl。",
+            "default": 1024,
+            "condition": {
+              "share_links_enabled": true
+            }
+          },
+          "download_cookie_file": {
+            "type": "string",
+            "description": "yt-dlp Cookie 文件路径",
+            "hint": "可选，填写 AstrBot 运行环境中的 Netscape 格式 Cookie 文件路径。抖音公开视频会自动获取匿名访问凭据，通常无需填写；需要登录或触发风控时可尝试配置有效的浏览器 Cookie。",
+            "default": "",
+            "condition": {
+              "share_links_enabled": true
+            }
+          },
+          "download_allow_fake_ip": {
+            "type": "bool",
+            "description": "兼容本机代理 Fake-IP DNS",
+            "hint": "仅在代理使用 198.18.0.0/15 虚拟 DNS 时开启；仍拒绝其他内网地址和直接 Fake-IP 链接。",
+            "default": false,
+            "condition": {
+              "share_links_enabled": true
+            }
+          }
+        }
+      },
+      "user_quota": {
+        "type": "object",
+        "description": "使用额度",
+        "items": {
+          "daily_analysis_limit": {
+            "type": "int",
+            "description": "普通用户每日分析次数上限",
+            "hint": "正整数，默认每天 5 次；按北京时间每天 00:00 重置。同一平台用户跨群聊、私聊共享额度，同一条消息中的概览和回看只计一次。管理员免除此每日限制；重启或重载保留当日用量。",
+            "default": 5
+          }
+        }
+      },
+      "runtime_cache": {
+        "type": "object",
+        "description": "运行与缓存",
+        "items": {
+          "max_edge_limit": {
+            "type": "int",
+            "description": "模型请求单帧图片长边的硬上限（像素）",
+            "hint": "限制离线视频概览与回看；实时画面使用独立的实时画面长边上限。九宫格保留各帧尺寸，拼接后不再按此值缩放。",
+            "default": 1280
+          },
+          "cache_ttl": {
+            "type": "float",
+            "description": "图片、转写缓存与会话授权有效期（秒）",
+            "default": 3600
+          },
+          "cache_max_mb": {
+            "type": "int",
+            "description": "图片与转写缓存容量上限（MB）",
+            "hint": "启动及工具空闲时清理过期缓存，超容量时从最旧缓存开始清理；不会删除源视频。",
+            "default": 512
+          }
+        }
       }
     }
   },
@@ -411,7 +456,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 960,
+                "default": 768,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -440,7 +485,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 960,
+                "default": 768,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -481,7 +526,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 960,
+                "default": 768,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -520,14 +565,14 @@
           {
             "__template_key": "demand",
             "sample_interval": 1.0,
-            "max_edge": 960,
+            "max_edge": 768,
             "max_frames": 4,
             "lookback_seconds": 2
           },
           {
             "__template_key": "interval",
             "sample_interval": 1.0,
-            "max_edge": 960,
+            "max_edge": 768,
             "max_frames": 4,
             "lookback_seconds": 10,
             "observation_interval": 10.0,
@@ -536,7 +581,7 @@
           {
             "__template_key": "change",
             "sample_interval": 0.5,
-            "max_edge": 960,
+            "max_edge": 768,
             "max_frames": 5,
             "lookback_seconds": 4,
             "sensitivity": "medium",
@@ -561,7 +606,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1280,
+                "default": 640,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -590,7 +635,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1280,
+                "default": 640,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -631,7 +676,7 @@
               "max_edge": {
                 "type": "int",
                 "description": "图片长边上限（像素）",
-                "default": 1280,
+                "default": 640,
                 "hint": "64～4096。用于本预设的采集和模型输入，保持比例且不放大小图。"
               },
               "max_frames": {
@@ -670,14 +715,14 @@
           {
             "__template_key": "demand",
             "sample_interval": 1.0,
-            "max_edge": 1280,
+            "max_edge": 640,
             "max_frames": 4,
             "lookback_seconds": 4
           },
           {
             "__template_key": "interval",
             "sample_interval": 1.0,
-            "max_edge": 1280,
+            "max_edge": 640,
             "max_frames": 4,
             "lookback_seconds": 10,
             "observation_interval": 10.0,
@@ -686,46 +731,13 @@
           {
             "__template_key": "change",
             "sample_interval": 0.5,
-            "max_edge": 1280,
+            "max_edge": 640,
             "max_frames": 6,
             "lookback_seconds": 6,
             "sensitivity": "medium",
             "min_analysis_interval": 5.0
           }
         ]
-      }
-    }
-  },
-  "runtime_cache": {
-    "type": "object",
-    "description": "运行与缓存",
-    "items": {
-      "max_edge_limit": {
-        "type": "int",
-        "description": "模型请求单帧图片长边的硬上限（像素）",
-        "hint": "限制离线视频概览与回看；实时画面使用独立的实时画面长边上限。九宫格保留各帧尺寸，拼接后不再按此值缩放。",
-        "default": 1280
-      },
-      "tool_timeout": {
-        "type": "float",
-        "description": "单次工具调用总超时（秒）",
-        "default": 300
-      },
-      "max_concurrency": {
-        "type": "int",
-        "description": "并发处理与子进程数量上限",
-        "default": 2
-      },
-      "cache_ttl": {
-        "type": "float",
-        "description": "图片、转写缓存与会话授权有效期（秒）",
-        "default": 3600
-      },
-      "cache_max_mb": {
-        "type": "int",
-        "description": "图片与转写缓存容量上限（MB）",
-        "hint": "启动及工具空闲时清理过期缓存，超容量时从最旧缓存开始清理；不会删除源视频。",
-        "default": 512
       }
     }
   }
