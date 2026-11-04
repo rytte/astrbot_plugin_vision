@@ -7,7 +7,6 @@ import base64
 import contextvars
 import io
 import json
-import logging
 import math
 import shutil
 import time
@@ -19,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from astrbot.api import logger
 from PIL import Image, UnidentifiedImageError
 
 from .config import LIVE_MODE_FIELDS, LIVE_PRESET_FIELDS, LivePreset, Settings
@@ -32,8 +32,6 @@ FRESH_SECONDS = 10
 MODEL_TIMEOUT_SECONDS = 45
 REPLY_TIMEOUT_SECONDS = 45
 COMMENT_MAX_AGE_SECONDS = MODEL_TIMEOUT_SECONDS + REPLY_TIMEOUT_SECONDS
-
-logger = logging.getLogger("astrbot")
 
 MODE_NAMES = {
     "提问": "demand",

@@ -1,7 +1,7 @@
 name: astrbot_plugin_vision
 display_name: 视频理解
 desc: 让 AstrBot 陪你看视频。支持视频分析和实时视频理解。视频分析提供混合抽帧视频概览、按需回看工具和分享链接自动解析；实时视觉支持接入屏幕截图、摄像头画面或媒体流，并可选择提问、定时、变化三种响应模式。支持 ASR 语音识别辅助理解，提供可视化流水线调试台。
-version: 1.2.0
+version: 1.2.1
 author: rytte
 astrbot_version: ">=4.27,<5"
 repo: https://github.com/rytte/astrbot_plugin_vision
